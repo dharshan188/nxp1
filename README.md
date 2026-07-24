@@ -8,6 +8,10 @@ ros2 launch b3rb_gz_bringup sil.launch.py world:=Raceway_1
 
 ---
 
+
+
+change files at  cd~/cognipilot/cranium/src/b3rb_ros_line_follower/b3rb_ros_line_follower/b3rb_ros_line_follower
+
 ## Terminal 2 – Run Edge Vector Detection
 
 ```bash
