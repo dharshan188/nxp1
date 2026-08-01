@@ -1,35 +1,31 @@
-# Running the B3RB ROS2 Line Follower
+Open a new terminal and follow the following steps for building Cranium and running Gazebo Simulation.
 
-## Terminal 1 – Launch Simulation
+cd ~/cognipilot/cranium/
+colcon build
 
-```bash
+It will start building 16 packages. Once building is complete, start fresh terminal. In case you face any error in colcon build, this means src folder is not right, follow from Setup Environment again.
+
+source ~/cognipilot/cranium/install/setup.bash
 ros2 launch b3rb_gz_bringup sil.launch.py world:=Raceway_1
-```
-
----
 
 
+Lane Vector Extractor:
 
-change files at  cd~/cognipilot/cranium/src/b3rb_ros_line_follower/b3rb_ros_line_follower/b3rb_ros_line_follower
+source ~/cognipilot/cranium/install/setup.bash
+ros2 run b3rb_ros_line_follower vectors
 
-## Terminal 2 – Run Edge Vector Detection
+Sign Board Classifier:
 
-```bash
-cd ~/cognipilot/cranium
+source ~/cognipilot/cranium/install/setup.bash
+ros2 run b3rb_ros_line_follower detect
 
-source install/setup.bash
 
-ros2 run b3rb_ros_line_follower b3rb_ros_edge_vectors
-```
+QR Scanner Node:
 
----
+source ~/cognipilot/cranium/install/setup.bash
+ros2 run b3rb_ros_line_follower qr_detect
 
-## Terminal 3 – Run Line Follower Controller
+Runner Node.
 
-```bash
-cd ~/cognipilot/cranium
-
-source install/setup.bash
-
-ros2 run b3rb_ros_line_follower b3rb_ros_line_follower
-```
+source ~/cognipilot/cranium/install/setup.bash
+ros2 run b3rb_ros_line_follower runner
