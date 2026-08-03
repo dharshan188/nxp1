@@ -1122,6 +1122,21 @@ class LineFollower(Node):
             return lane_width / 2.0
         return max(margin, min(lane_width - margin, offset))
 
+    def _clamp_to_lane(self, lane_center, left_edge, right_edge):
+        """Hard lane-keeping guard.
+
+        Constrains the aim point to stay strictly inside the detected lane
+        boundaries [left_edge, right_edge], keeping at least
+        turn_edge_margin_px from each edge.  If the lane is too narrow to fit
+        the margins, the aim is centered.  This makes it impossible for the
+        controller to steer the robot out of the lane, even under junction
+        bias, single-edge tracking or noise.
+        """
+        margin = self.turn_edge_margin_px
+        if right_edge - left_edge <= 2.0 * margin:
+            return 0.5 * (left_edge + right_edge)
+        return max(left_edge + margin, min(right_edge - margin, lane_center))
+
     # ------------------------------------------------------------------
     # Intersection state-machine helpers
     # ------------------------------------------------------------------
@@ -1255,9 +1270,17 @@ class LineFollower(Node):
                                 self._straight_junction_side = (
                                     'L' if abs(cfl - img_center) < abs(cfr - img_center) else 'R')
                             if self._straight_junction_side == 'L':
+                                # Aim point is left of center; apply inward bias for left turn
                                 lane_center = left_x + 0.50 * self.learned_lane_width
                             else:
+                                # Aim point is right of center; apply inward bias for right turn
                                 lane_center = right_x - 0.50 * self.learned_lane_width
+
+                            # Apply curvature-based bias: shift away from outer lane edge during turns
+                            if abs(current_heading) > math.radians(5):
+                                # Positive heading => left turn, bias rightwards; negative => right turn, bias leftwards
+                                bias = -math.copysign(0.05 * lane_width, current_heading)
+                                lane_center = self._clamped_offset(lane_center + bias, lane_width)
                         else:
                             lane_center = (left_x + right_x) / 2.0
                             self._straight_junction_side = None
@@ -1270,6 +1293,7 @@ class LineFollower(Node):
                             self._width_ema_samples += 1
                         self._last_two_vec_time = now
                         self._last_good_heading = current_heading
+                        lane_center = self._clamp_to_lane(lane_center, left_x, right_x)
                         raw_cte = (lane_center - img_center) / img_center
                         self._last_good_cte = raw_cte
                         self.vectors_available = True
@@ -1317,6 +1341,8 @@ class LineFollower(Node):
                         lane_center = (left_x + right_x) / 2.0
                         self._straight_junction_side = None
 
+                    # Hard lane-keeping guard: aim point can never leave the lane.
+                    lane_center = self._clamp_to_lane(lane_center, left_x, right_x)
                     raw_cte = (lane_center - img_center) / img_center
                     reason = None
                     if lane_width > self.learned_lane_width * self.intersect_entry_width_ratio:
@@ -1369,6 +1395,8 @@ class LineFollower(Node):
                 elif self.current_mission == "RIGHT":
                     offset = self._clamped_offset(0.35 * lane_width, lane_width)
                     lane_center = right_x - offset
+                # Hard lane-keeping guard: aim point can never leave the lane.
+                lane_center = self._clamp_to_lane(lane_center, left_x, right_x)
                 self.vectors_available = True
                 if self.learn_lane_width:
                     if 150.0 < lane_width < (img_w * 0.65):
@@ -1430,10 +1458,17 @@ class LineFollower(Node):
             else:
                 offset = self._clamped_offset(0.50 * lane_width, lane_width)
 
+            # Hard lane-keeping guard: with only one edge visible, the aim
+            # point is constrained to the reconstructed lane so the robot can
+            # never steer outside it.  When the seen edge is the LEFT side the
+            # lane spans [aim, aim + lane_width]; when RIGHT it spans
+            # [aim - lane_width, aim].
             if self.last_single_side == 'LEFT':
                 lane_center = aim + offset
+                lane_center = self._clamp_to_lane(lane_center, aim, aim + lane_width)
             else:
                 lane_center = aim - (lane_width - offset)
+                lane_center = self._clamp_to_lane(lane_center, aim - lane_width, aim)
             self.vectors_available = True
 
         # ---------------------------------------------------------------
