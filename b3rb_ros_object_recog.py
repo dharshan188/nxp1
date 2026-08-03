@@ -15,17 +15,6 @@
 import rclpy
 from rclpy.node import Node
 from rclpy.parameter import Parameter
-
-try:
-    from synapse_msgs.msg import ServerCommunication
-except ImportError:
-    ServerCommunication = None
-
-try:
-    from rosidl_runtime_py.utilities import get_message
-except ImportError:
-    get_message = None
-
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
 import cv2
@@ -61,7 +50,8 @@ BOARD_CENTER_WEIGHT = 2.0      # higher = stronger preference for centered board
 
 # Board exit reset. After mission lock, the node waits until the board is gone
 # for this many frames, then unlocks and searches again for the SAME current
-# goal. /ServerCommunication can change the goal at any time.
+# goal. /mission/available (from the QR Detector at assignment time) changes
+# the goal at any time.
 EXIT_MISSING_FRAMES_MAX = 12
 
 # Do not tolerate missed/low-confidence frames for locking. A single bad frame
@@ -83,6 +73,7 @@ ARROW_Y1_RATIO = 0.96
 ARROW_UPPER_Y0 = 0.30
 ARROW_UPPER_Y1 = 0.55
 ARROW_X_MARGIN_RATIO = 0.07
+
 WHITE_HSV_LOW = np.array([0, 0, 115])
 WHITE_HSV_HIGH = np.array([180, 125, 255])
 
@@ -103,21 +94,38 @@ ARROW_MIN_PIXELS = 200
 # Straight must be REALLY vertical/narrow. Earlier value 1.45 caused broken
 # LEFT/RIGHT arrow fragments to be called STRAIGHT at mid range.
 STRAIGHT_ASPECT_MAX = 1.05
+
 # Treat moderate-width blobs as horizontal arrows; if centroid is weak they
 # will be skipped instead of guessed.
 HORIZONTAL_ASPECT_MIN = 1.20
 DIR_ASYM_DEAD_ZONE = 0.10
 DIR_ASYM_STRONG = 0.25
+
 # Horizontal LEFT/RIGHT decision. Centroid is more stable than row-extents at
 # mid/far range. Negative centroid offset = LEFT, positive = RIGHT.
 CENTROID_DEAD_ZONE = 0.025
 CENTROID_STRONG = 0.055
+
 # Do not accept weak STRAIGHT reads. False A/B straight mistakes were
 # low-confidence (~0.82). Real straight arrows in samples score >0.90, so weak
 # STRAIGHT reads are ignored.
 STRAIGHT_ACCEPT_CONF = 0.90
+
 DEFAULT_CONFIDENCE_THRESHOLD = 0.90
 DEFAULT_REQUIRED_CONSECUTIVE = 5
+
+# Mission mapping for /target_qr (replaces Municipality Server dest parsing)
+PATIENT_QR_TO_GOAL = {
+    "PATIENT_1": "A",
+    "PATIENT_2": "B",
+    "PATIENT_3": "C",
+}
+HOSPITAL_QR_TO_GOAL = {
+    "HOSPITAL_1": "X",
+    "HOSPITAL_2": "Y",
+    "HOSPITAL_3": "Z",
+}
+TARGET_QR_TO_GOAL = {**PATIENT_QR_TO_GOAL, **HOSPITAL_QR_TO_GOAL}
 
 
 def order_points(pts):
@@ -240,6 +248,7 @@ def select_arrow_component(mask):
     kept_any = False
     best_score = 0.0
     best_id = None
+
     for cid in range(1, n_labels):
         area = int(stats[cid, cv2.CC_STAT_AREA])
         x, y, bw, bh = stats[cid, 0:4]
@@ -286,6 +295,7 @@ def select_arrow_component(mask):
         # as a STRAIGHT arrow at mid range.
         if cy < 0.18 * h:
             continue
+
         selected[labels == cid] = 255
         kept_any = True
         bbox_area = float(bw * bh)
@@ -295,10 +305,12 @@ def select_arrow_component(mask):
         if score > best_score:
             best_score = score
             best_id = cid
+
     if kept_any:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         selected = cv2.morphologyEx(selected, cv2.MORPH_CLOSE, kernel, iterations=1)
         return selected
+
     # Fallback: keep best component if everything was filtered too hard.
     if best_id is not None:
         selected[labels == best_id] = 255
@@ -310,19 +322,23 @@ def classify_arrow_mask(mask):
     ys, xs = np.where(mask > 0)
     if xs.size < 20 or ys.size < 20:
         return None, 0.0
+
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     bw = x1 - x0 + 1
     bh = y1 - y0 + 1
     if bw < 7 or bh < ARROW_MIN_HEIGHT:
         return None, 0.0
+
     aspect = bw / float(bh + 1e-6)
     pixels = int(xs.size)
+
     # Quality gate: a reliable arrow has enough mass. Tiny/degraded blobs (far
     # range, blur) score high confidence but are wrong -> reject ("in doubt,
     # leave it") so a direction is only emitted when the arrow is substantial.
     if pixels < ARROW_MIN_PIXELS:
         return None, 0.0
+
     sub = (mask[y0:y1 + 1, x0:x1 + 1] > 0).astype(np.uint8)
     col_counts = sub.sum(axis=0).astype(np.float32)
     row_counts = sub.sum(axis=1).astype(np.float32)
@@ -371,6 +387,7 @@ def classify_arrow_mask(mask):
     )
     if not horizontal_like:
         return None, 0.0
+
     # Centroid relative to bbox center is stable for left/right on this board.
     bbox_center_x = 0.5 * (x0 + x1)
     centroid_x = float(xs.mean())
@@ -388,11 +405,11 @@ def classify_arrow_mask(mask):
 def read_arrow_direction(cell, debug=False):
     """Read one cell's arrow, trying both vertical layouts and keeping the
     most confident classification. Contaminated (flooded) ROIs are rejected.
-
     Returns (direction, confidence); direction is None if no reliable read.
     """
     best = (None, 0.0)
     best_artifacts = None
+
     for y0_ratio, y1_ratio in (
         (ARROW_UPPER_Y0, ARROW_UPPER_Y1),   # upper-middle layout
         (ARROW_Y0_RATIO, ARROW_Y1_RATIO),   # lower layout
@@ -403,19 +420,23 @@ def read_arrow_direction(cell, debug=False):
         arrow = select_arrow_component(mask)
         if arrow is None:
             continue
+
         # Flood-guard: one arrow cannot fill most of the ROI -> contaminated.
         if arrow.size and (arrow.sum() / 255.0) / arrow.size > ARROW_FILL_MAX:
             continue
+
         direction, confidence = classify_arrow_mask(arrow)
         if direction is not None and confidence > best[1]:
             best = (direction, confidence)
             best_artifacts = (roi, mask, arrow)
+
     if debug and best_artifacts is not None:
         roi, mask, arrow = best_artifacts
         cv2.imshow("arrow_roi", roi)
         cv2.imshow("arrow_mask", mask)
         cv2.imshow("arrow_selected", arrow)
         cv2.waitKey(1)
+
     return best
 
 
@@ -495,13 +516,17 @@ def select_target_board(board_reads, frame_shape):
 
 
 # ============================================================================
-# ROS2 NODE
+# ROS2 NODE - SIMPLIFIED COMMUNICATION: NO MUNICIPALITY SERVER
 # ============================================================================
 class ObjectRecognizer(Node):
     """
     ROS2 node:
       - subscribes camera image
-      - subscribes /ServerCommunication for the goal letter
+      - subscribes /mission/available for immediate goal updates (Purpose 1:
+        Municipality -> QR Detector -> Object Recognizer).  The goal updates
+        at assignment time, before the QR is verified.  It does NOT depend on
+        /target_qr (that topic is the QR Detector -> Line Follower path,
+        Purpose 2, published only after QR match).
       - processes every detected board
       - publishes locked turn direction on /mission/turn
       - after the board disappears, resets and searches again for current goal
@@ -529,20 +554,31 @@ class ObjectRecognizer(Node):
         self.current_mission = None
         self.missing_frames = 0
 
+        # Mission target cache (replaces Municipality Server).
+        # latest_target_qr holds the CANONICAL target (from /mission/available)
+        # of the CURRENT mission.  Initialized to None so the first real
+        # mission is never mistaken for a duplicate.
+        self.latest_target_type = "PATIENT"
+        self.latest_target_qr = None
+
         self.subscription_camera = self.create_subscription(
             CompressedImage,
             '/camera/image_raw/compressed',
             self.camera_image_callback,
             10)
 
-        self.subscription_server_communication = None
-        self._server_comm_dynamic_timer = None
-
-        if not self._create_server_communication_subscription():
-            self.get_logger().warn(
-                "Waiting for /ServerCommunication topic type... Will retry.")
-            self._server_comm_dynamic_timer = self.create_timer(
-                1.0, self._try_create_server_communication_subscription)
+        # Purpose 1 (Municipality -> QR Detector -> Object Recognizer):
+        # every new mission is received immediately after Municipality
+        # assignment via /mission/available.  The QR Detector publishes this
+        # topic at assignment time with the target QR payload (e.g. PATIENT_2).
+        # The detector does NOT depend on /target_qr for goal updates —
+        # /target_qr (Purpose 2) is only published after the QR is verified and
+        # is consumed by the Line Follower, not by this node.
+        self.subscription_mission_available = self.create_subscription(
+            String,
+            '/mission/available',
+            self.mission_available_callback,
+            10)
 
         self.publisher_turn = self.create_publisher(
             String,
@@ -550,99 +586,23 @@ class ObjectRecognizer(Node):
             10)
 
         self.get_logger().info(
-            f"Object Recognizer started. Multi-board enabled. Active goal = {self.goal_letter}. /ServerCommunication may change it.")
-
-    def _extract_goal_letter(self, text):
-        """Extract a valid goal letter from the text field only.
-
-        This avoids false parsing from words like "okay".
-        Examples accepted: "x", "X OKAY RIGHT", "goal:x".
-        """
-        if text is None:
-            return None
-        text = str(text).strip().upper()
-        if not text:
-            return None
-        # First token is the cleanest format: msg: x okay right
-        first = text.replace(':', ' ').replace(',', ' ').split()[0]
-        if first in LETTER_ORDER:
-            return first
-        # Accept explicit goal=<letter> / goal:<letter> / letter=<letter>.
-        normalized = text.replace(':', ' ').replace('=', ' ').replace(',', ' ')
-        tokens = normalized.split()
-        for i, tok in enumerate(tokens[:-1]):
-            if tok in ('GOAL', 'LETTER', 'TARGET') and tokens[i + 1] in LETTER_ORDER:
-                return tokens[i + 1]
-        return None
-
-    def _goal_from_server_message(self, message):
-        """Map /ServerCommunication destination to goal letter.
-
-        Mapping requested:
-            dest 1 -> A
-            dest 2 -> B
-            dest 3 -> C
-            dest 4 -> X
-            dest 5 -> Y
-            dest 6 -> Z
-
-        The free-text msg field is intentionally ignored here. Your server
-        message may contain words like "right", but that is NOT the goal.
-        """
-        dest_map = {1: 'A', 2: 'B', 3: 'C', 4: 'X', 5: 'Y', 6: 'Z'}
-        try:
-            dest = int(getattr(message, 'dest'))
-        except Exception:
-            return None
-        return dest_map.get(dest)
-
-    def _create_server_communication_subscription(self):
-        """Create /ServerCommunication subscription.
-
-        Uses synapse_msgs.msg.ServerCommunication if available. If the exact
-        class name is different, it falls back to ROS2 topic introspection.
-        """
-        if self.subscription_server_communication is not None:
-            return True
-        msg_type = None
-        # Prefer the real runtime topic type. This avoids hard-coding the
-        # custom message class name.
-        if get_message is not None:
-            for topic_name, topic_types in self.get_topic_names_and_types():
-                if topic_name == '/ServerCommunication' and topic_types:
-                    try:
-                        msg_type = get_message(topic_types[0])
-                        break
-                    except Exception as exc:
-                        self.get_logger().warn(
-                            f"Could not load /ServerCommunication type {topic_types[0]}: {exc}")
-        # Fallback if the topic has not appeared yet but the generated message
-        # class is available as synapse_msgs.msg.ServerCommunication.
-        if msg_type is None:
-            msg_type = ServerCommunication
-        if msg_type is None:
-            return False
-        self.subscription_server_communication = self.create_subscription(
-            msg_type,
-            '/ServerCommunication',
-            self.server_communication_callback,
-            10)
-        self.get_logger().info(
-            f"Subscribed to /ServerCommunication ({msg_type.__module__}.{msg_type.__name__})")
-        return True
-
-    def _try_create_server_communication_subscription(self):
-        if self._create_server_communication_subscription():
-            if self._server_comm_dynamic_timer is not None:
-                self._server_comm_dynamic_timer.cancel()
-                self._server_comm_dynamic_timer = None
+            f"Object Recognizer started. Multi-board enabled. Active goal = {self.goal_letter}. "
+            f"Listening to /mission/available for immediate mission updates (Municipality Server removed).")
 
     def _reset_detection_state(self):
+        """Full detector-state reset for a brand-new mission.
+
+        Clears every counter/streak/lock/cached value that belongs to the
+        previous mission so the detector can never continue searching for an
+        old goal.
+        """
         self.prev_direction = None
         self.consecutive_count = 0
         self.skip_count = 0
         self.current_mission = None
         self.missing_frames = 0
+        self.mission_locked = False
+        self.goal_valid = True
 
     def _set_goal(self, new_goal, source):
         if new_goal is None or new_goal not in LETTER_ORDER:
@@ -664,31 +624,130 @@ class ObjectRecognizer(Node):
         self.mission_locked = False
         self._reset_detection_state()
         self.get_logger().info(
-            f"Board exited. Continuing with current goal '{current_goal}'. Waiting for next board or /ServerCommunication update.")
+            f"Board exited. Continuing with current goal '{current_goal}'. Waiting for next board or /mission/available update.")
 
-    def server_communication_callback(self, message):
-        new_goal = self._goal_from_server_message(message)
-        if new_goal is None:
-            self.get_logger().warn(
-                f"Ignoring /ServerCommunication message without valid goal. dest={getattr(message, 'dest', None)} msg='{getattr(message, 'msg', None)}'")
+    # ------------------------------------------------------------------
+    # PURPOSE-1 COMMUNICATION: Municipality -> QR Detector -> Object Recognizer
+    # ------------------------------------------------------------------
+    def mission_available_callback(self, msg):
+        """
+        Receive every new mission from the QR Detector immediately after a
+        Municipality assignment, via /mission/available.
+
+        This is the ONLY goal-update path for the Object Recognizer.  It runs
+        at ASSIGNMENT time, BEFORE the QR is verified, so the detector always
+        searches for the newest goal without waiting for QR verification and
+        without a node restart.
+
+        The detector does NOT depend on /target_qr for goal updates.  /target_qr
+        (Purpose 2: QR Detector -> Line Follower) is published only after the
+        QR has actually been matched and is consumed by the Line Follower.
+
+        Mapping (kept exactly):
+            PATIENT_1->A, PATIENT_2->B, PATIENT_3->C,
+            HOSPITAL_1->X, HOSPITAL_2->Y, HOSPITAL_3->Z
+
+        A duplicate mission (same target as the current one) is ignored —
+        no reset, no stale goal.
+        """
+        if msg is None or not msg.data:
             return
-        self.get_logger().info(
-            f"/ServerCommunication received: src={getattr(message, 'src', None)} "
-            f"dest={getattr(message, 'dest', None)} "
-            f"msg='{getattr(message, 'msg', None)}' -> goal={new_goal}")
-        changed = self._set_goal(new_goal, '/ServerCommunication')
-        # Keep parameter server synchronized with server goal.
-        if changed:
-            self._last_param_goal = new_goal
+        raw_qr = msg.data.strip()
+        qr_upper = raw_qr.strip().upper()
+
+        # Normalize: extract PATIENT_* or HOSPITAL_* if wrapped in {LOC: ...} or similar
+        normalized_qr = qr_upper
+        for known in TARGET_QR_TO_GOAL.keys():
+            if known in qr_upper:
+                normalized_qr = known
+                break
+
+        if normalized_qr not in TARGET_QR_TO_GOAL:
+            self.get_logger().info(
+                f"Ignoring /mission/available: '{raw_qr}' - not in mapping "
+                f"{list(TARGET_QR_TO_GOAL.keys())}")
+            return
+
+        mapped_goal = TARGET_QR_TO_GOAL[normalized_qr]
+
+        # Infer target type for logging.
+        if "PATIENT" in normalized_qr:
+            target_type = "PATIENT"
+        elif "HOSPITAL" in normalized_qr:
+            target_type = "HOSPITAL"
+        else:
+            target_type = self.latest_target_type
+
+        # Duplicate handling.  Identical target to the current mission -> do
+        # nothing, do NOT reset, do NOT clear counters.  Only log.
+        if self.latest_target_qr is not None and self.latest_target_qr == normalized_qr:
+            self.get_logger().info(
+                "Duplicate mission ignored.\n"
+                f"Target Type : {target_type}\n"
+                f"Target QR   : {normalized_qr}\n"
+                f"Current Goal: {self.goal_letter}\n"
+                "No state reset performed."
+            )
+            return
+
+        # NEW MISSION: keep the old goal only for logging, then fully reset.
+        old_goal = self.goal_letter
+
+        # Discard the previous mission completely.
+        self._reset_detection_state()   # clears prev_direction, consecutive_count,
+                                        # skip_count, current_mission, missing_frames,
+                                        # mission_locked, goal_valid
+
+        # Assign the new mapped goal.
+        self.goal_letter = mapped_goal
+        self.goal_valid = True
+        self._last_param_goal = mapped_goal
+
+        # Synchronize every cached mission variable to the new mission.
+        self.latest_target_qr = normalized_qr
+        self.latest_target_type = target_type
+
+        # Synchronize the ROS parameter that stores the goal.
+        try:
             self.set_parameters([
-                Parameter('goal_letter', Parameter.Type.STRING, new_goal)
+                Parameter('goal_letter', Parameter.Type.STRING, mapped_goal)
             ])
+        except Exception:
+            pass
+
+        # Detailed log per required format.
+        self.get_logger().info(
+            "\n========================================\n"
+            "NEW MISSION RECEIVED (from /mission/available)\n"
+            "\n"
+            f"Target Type : {target_type}\n"
+            f"Target QR   : {normalized_qr}\n"
+            "\n"
+            f"Old Goal    : {old_goal}\n"
+            f"New Goal    : {mapped_goal}\n"
+            "\n"
+            f"Mission Reset : YES\n"
+            f"Mission Lock  : CLEARED\n"
+            f"Counters      : RESET\n"
+            "\n"
+            f"Searching for Goal {mapped_goal}...\n"
+            "========================================\n"
+        )
+        if old_goal != mapped_goal:
+            self.get_logger().info(
+                f"Goal changed: {old_goal} -> {mapped_goal} from {raw_qr} (type {target_type}). "
+                f"Previous mission lock cleared, consecutive count reset, board exit counter reset."
+            )
+        else:
+            self.get_logger().info(
+                f"Goal {mapped_goal} reconfirmed from {raw_qr}. Detector reset for fresh search."
+            )
 
     def _check_parameter_goal(self):
         """
         Parameter support is kept, but it only reacts to actual parameter
         changes. The current goal persists after board exit unless
-        ServerCommunication or parameter explicitly changes it.
+        /mission/available or parameter explicitly changes it.
         """
         param_goal = self.get_parameter('goal_letter').get_parameter_value().string_value.upper()
         if param_goal not in LETTER_ORDER:
@@ -736,7 +795,6 @@ class ObjectRecognizer(Node):
         required_consecutive = self.get_parameter('required_consecutive').get_parameter_value().integer_value
 
         board_reads = read_boards(image)
-
         if not board_reads:
             self.prev_direction = None
             self.consecutive_count = 0
@@ -748,7 +806,6 @@ class ObjectRecognizer(Node):
         # the forward/center board. This avoids a side board with high confidence
         # changing the mission.
         target_board = select_target_board(board_reads, image.shape)
-
         best = None
         if target_board is not None:
             x0, y0, x1, y1 = target_board["bbox"]
