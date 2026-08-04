@@ -60,6 +60,8 @@ class LineFollower(Node):
         self.declare_parameter('obstacle_turn_gain', 0.9)
         self.declare_parameter('obstacle_speed', 0.32)
         self.declare_parameter('obstacle_stop_dist', 0.38)
+        # If very close, do not freeze forever; creep with max avoidance turn.
+        self.declare_parameter('obstacle_escape_speed', 0.10)
 
         # --- edge-safety margin so the aim point never sits right on the curb ---
         self.declare_parameter('turn_edge_margin_px', 35.0)
@@ -108,6 +110,13 @@ class LineFollower(Node):
         self.declare_parameter('zone_confirm_scans', 3)
         self.declare_parameter('zone_fov_min_deg', -45.0)
         self.declare_parameter('zone_fov_max_deg', 15.0)
+        # Hospital side returns are fewer/wider in your logs, so use a slightly
+        # wider band and lower beam threshold for HOSPITAL only.
+        # PATIENT still uses the original band/threshold above.
+        self.declare_parameter('hospital_zone_close_min_dist', 0.65)
+        self.declare_parameter('hospital_zone_close_max_dist', 1.10)
+        self.declare_parameter('hospital_zone_close_beam_threshold', 3)
+        self.declare_parameter('hospital_zone_confirm_scans', 2)
 
         # Mission-side safe-zone LiDAR sectors.
         # IMPORTANT: in this simulator's LaserScan convention, the zone for a
@@ -131,17 +140,17 @@ class LineFollower(Node):
 
         # NEW: target-type-specific parking distances.
         # Patient was already good with 1.2 m.
-        self.declare_parameter('parking_forward_distance_patient', 1.4)
-        # Hospital zone is longer, so drive deeper inside.
-        self.declare_parameter('parking_forward_distance_hospital', 1.4)
+        self.declare_parameter('parking_forward_distance_patient', 1.5)
+        # Hospital zone is longer; drive much deeper inside.
+        self.declare_parameter('parking_forward_distance_hospital', 2.1)
 
         # NEW: parking/safe-zone-entry obstacle safety.
         # This remains active in ENTERING_SAFE_ZONE where old code forced turn=0.
         self.declare_parameter('parking_obstacle_enable', True)
         self.declare_parameter('parking_obstacle_fov_deg', 120.0)
-        self.declare_parameter('parking_obstacle_trigger_dist', 0.85)
-        self.declare_parameter('parking_obstacle_clear_dist', 1.05)
-        self.declare_parameter('parking_obstacle_stop_dist', 0.38)
+        self.declare_parameter('parking_obstacle_trigger_dist', 0.55)
+        self.declare_parameter('parking_obstacle_clear_dist', 0.75)
+        self.declare_parameter('parking_obstacle_stop_dist', 0.32)
         self.declare_parameter('parking_obstacle_turn_gain', 1.00)
         self.declare_parameter('parking_obstacle_speed', 0.08)
         # If the buggy gets too close in parking, do not remain stuck.
@@ -237,6 +246,10 @@ class LineFollower(Node):
         self._zone_min_dist = float('inf')
         self._zone_consecutive_scans = 0
         self._zone_detection_state = "MISS"
+        self._zone_active_close_min = self.zone_close_min_dist
+        self._zone_active_close_max = self.zone_close_max_dist
+        self._zone_active_threshold = self.zone_close_beam_threshold
+        self._zone_active_confirm_scans = self.zone_confirm_scans
         self._safe_zone_published = False
 
         # Parking bookkeeping
@@ -413,6 +426,7 @@ class LineFollower(Node):
         self.obstacle_turn_gain = g('obstacle_turn_gain')
         self.obstacle_speed = g('obstacle_speed')
         self.obstacle_stop_dist = g('obstacle_stop_dist')
+        self.obstacle_escape_speed = g('obstacle_escape_speed')
 
         self.turn_edge_margin_px = g('turn_edge_margin_px')
         self.lane_guard_enable = g('lane_guard_enable')
@@ -449,6 +463,10 @@ class LineFollower(Node):
         self.zone_confirm_scans = int(g('zone_confirm_scans'))
         self.zone_fov_min_deg = g('zone_fov_min_deg')
         self.zone_fov_max_deg = g('zone_fov_max_deg')
+        self.hospital_zone_close_min_dist = g('hospital_zone_close_min_dist')
+        self.hospital_zone_close_max_dist = g('hospital_zone_close_max_dist')
+        self.hospital_zone_close_beam_threshold = int(g('hospital_zone_close_beam_threshold'))
+        self.hospital_zone_confirm_scans = int(g('hospital_zone_confirm_scans'))
         self.zone_use_mission_side_sector = g('zone_use_mission_side_sector')
         self.zone_right_fov_min_deg = g('zone_right_fov_min_deg')
         self.zone_right_fov_max_deg = g('zone_right_fov_max_deg')
@@ -772,6 +790,43 @@ class LineFollower(Node):
 
         self.last_valid_mission = mission
 
+    def _activate_assignment_from_available(self, assignment):
+        """Activate target assignment received on /mission/available.
+
+        Your logs showed target_type=NONE and FSM=NAVIGATING_TO_NEXT_TARGET
+        after QR/assignment, so safe-zone detection was never armed. This
+        helper treats a valid PATIENT_x / HOSPITAL_x assignment as the active
+        target immediately and enters WAITING_FOR_SAFE_ZONE.
+        """
+        upper = assignment.strip().upper()
+        if upper.startswith("PATIENT_"):
+            ttype = "PATIENT"
+        elif upper.startswith("HOSPITAL_"):
+            ttype = "HOSPITAL"
+        else:
+            return False
+
+        self._complete_active_mission("New assignment activated")
+
+        self.active_target_type = ttype
+        self.active_target_qr = assignment.strip()
+        self.target_qr_string = assignment.strip()
+        self._last_mission_key = (ttype, assignment.strip())
+        self._clear_pending_assembly()
+        self._reset_zone_detection()
+
+        self.get_logger().info(
+            "Mission assignment activated from /mission/available:\n"
+            f"Target Type : {ttype}\n"
+            f"Target      : {assignment.strip()}"
+        )
+
+        self._transition_mission_state(
+            MissionState.WAITING_FOR_SAFE_ZONE,
+            f"Mission available assignment activated ({assignment.strip()})"
+        )
+        return True
+
     # ------------------------------------------------------------------
     # New Mission Available callback
     # ------------------------------------------------------------------
@@ -786,6 +841,10 @@ class LineFollower(Node):
             self.get_logger().info(f"/mission/available ignored: invalid target payload: {assignment}")
             return
 
+        # IMPORTANT: /mission/available is only a WAKE-UP / next-goal notice.
+        # It must NOT arm WAITING_FOR_SAFE_ZONE immediately, otherwise the buggy
+        # slows/stalls right after goal assignment. Safe-zone parking is armed
+        # only by the atomic /target_type + /target_qr callbacks.
         if self.mission_state in (
                 MissionState.MISSION_COMPLETE,
                 MissionState.PARKED_IN_SAFE_ZONE,
@@ -794,6 +853,27 @@ class LineFollower(Node):
             self._transition_mission_state(
                 MissionState.NAVIGATING_TO_NEXT_TARGET,
                 f"New mission assigned by QR Detector ({assignment})"
+            )
+            return
+
+        if self.mission_state in (MissionState.NORMAL_LINE_FOLLOWING,
+                                  MissionState.NAVIGATING_TO_NEXT_TARGET):
+            # Already moving/ready. Keep driving; wait for /target_type and
+            # /target_qr to activate WAITING_FOR_SAFE_ZONE.
+            self.get_logger().info(
+                f"/mission/available noted while {self.mission_state}: {assignment} "
+                "— continuing navigation, awaiting /target_type + /target_qr."
+            )
+            return
+
+        # Busy parking / already waiting for a safe zone: queue as next assignment.
+        if self.mission_state in (MissionState.WAITING_FOR_SAFE_ZONE,
+                                  MissionState.ENTERING_SAFE_ZONE):
+            self.pending_next_type = "PATIENT" if upper.startswith("PATIENT_") else "HOSPITAL"
+            self.pending_next_qr = assignment
+            self.pending_next_qr_time = time.time()
+            self.get_logger().info(
+                f"/mission/available queued while {self.mission_state}: {assignment}"
             )
             return
 
@@ -1213,6 +1293,23 @@ class LineFollower(Node):
 
         return [(float(self.zone_fov_min_deg), float(self.zone_fov_max_deg))]
 
+    def _active_zone_thresholds(self):
+        """Return close-distance band, beam threshold and confirm scans.
+
+        PATIENT = original settings.
+        HOSPITAL = side-sector detector with fewer close beams, so lower
+        threshold and wider max distance.
+        """
+        if self._is_hospital_target():
+            return (float(self.hospital_zone_close_min_dist),
+                    float(self.hospital_zone_close_max_dist),
+                    int(self.hospital_zone_close_beam_threshold),
+                    int(self.hospital_zone_confirm_scans))
+        return (float(self.zone_close_min_dist),
+                float(self.zone_close_max_dist),
+                int(self.zone_close_beam_threshold),
+                int(self.zone_confirm_scans))
+
     # ------------------------------------------------------------------
     # LiDAR callback — obstacle avoidance + safe-zone + wall geometry
     # ------------------------------------------------------------------
@@ -1294,6 +1391,12 @@ class LineFollower(Node):
         sectors = self._active_zone_sectors()
         self._zone_active_fov_min_deg = min(a for a, _ in sectors)
         self._zone_active_fov_max_deg = max(b for _, b in sectors)
+        (active_close_min, active_close_max,
+         active_threshold, active_confirm) = self._active_zone_thresholds()
+        self._zone_active_close_min = active_close_min
+        self._zone_active_close_max = active_close_max
+        self._zone_active_threshold = active_threshold
+        self._zone_active_confirm_scans = active_confirm
 
         valid_distances = []
         sector_data = []
@@ -1318,7 +1421,7 @@ class LineFollower(Node):
                 if math.isfinite(r) and r > 0.05:
                     valid_distances.append(r)
                     min_dist = min(min_dist, r)
-                    if self.zone_close_min_dist <= r <= self.zone_close_max_dist:
+                    if active_close_min <= r <= active_close_max:
                         close_count += 1
 
         self._zone_sector_data = sector_data
@@ -1474,7 +1577,10 @@ class LineFollower(Node):
                 want_turn = max(TURN_MIN, min(TURN_MAX,
                                 0.35 * self.target_turn + self.obstacle_turn))
                 if self.nearest_dist <= self.obstacle_stop_dist:
-                    want_speed = 0.0
+                    # Very close obstacle: do NOT stay frozen. Creep slowly
+                    # with strong avoidance turn so it can clear the obstacle.
+                    want_speed = self.obstacle_escape_speed
+                    want_turn = self.obstacle_turn
                 else:
                     want_speed = self.obstacle_speed
             elif self._in_intersection:
@@ -1498,65 +1604,37 @@ class LineFollower(Node):
         if self.mission_state == MissionState.WAITING_FOR_SAFE_ZONE:
             want_speed = min(want_speed, self.slow_approach_speed)
 
-        # ---- PARKING obstacle recovery ----
-        # Recovery is ONLY triggered when the buggy is actually too close
-        # to an obstacle (parking_obstacle_stop). Normal/medium-range
-        # obstacle detections do NOT steer the buggy out of lane.
+        # ---- PARKING obstacle safety: hard-stop only ----
+        # The old slow-avoid behavior made the buggy crawl/stop near the edge
+        # before covering the parking distance. Now parking keeps its normal
+        # parking_speed and only stops if something is truly too close.
+        # No reverse/recovery and no early slow-down.
         if (self.mission_state == MissionState.ENTERING_SAFE_ZONE
                 and self.parking_obstacle_enable):
+            self._parking_recovery_phase = "NONE"
 
-            # Existing recovery maneuver in progress.
-            if self._parking_recovery_phase == "REVERSING":
-                if now < self._parking_recovery_until:
-                    want_speed = float(self.parking_reverse_speed)
-                    want_turn = 0.0
-                    self.filtered_speed = want_speed
-                    self.filtered_turn = 0.0
-                else:
-                    self._parking_recovery_phase = "ESCAPING"
-                    self._parking_recovery_until = now + float(self.parking_escape_time)
-                    want_speed = float(self.parking_escape_speed)
-                    want_turn = max(TURN_MIN, min(TURN_MAX,
-                        self._parking_escape_turn * float(self.parking_escape_turn_gain)))
-
-            elif self._parking_recovery_phase == "ESCAPING":
-                if now < self._parking_recovery_until:
-                    want_speed = min(want_speed, float(self.parking_escape_speed))
-                    want_turn = max(TURN_MIN, min(TURN_MAX,
-                        self._parking_escape_turn * float(self.parking_escape_turn_gain)))
-                    if self.parking_obstacle_stop:
-                        self._parking_recovery_phase = "REVERSING"
-                        self._parking_recovery_until = now + float(self.parking_reverse_time)
-                        want_speed = float(self.parking_reverse_speed)
-                        want_turn = 0.0
-                        self.filtered_speed = want_speed
-                        self.filtered_turn = 0.0
-                else:
-                    self._parking_recovery_phase = "NONE"
-
-            # Start recovery ONLY when obstacle is in hard-stop distance.
-            if self._parking_recovery_phase == "NONE" and self.parking_obstacle_stop:
-                self._parking_recovery_phase = "REVERSING"
-                self._parking_recovery_until = now + float(self.parking_reverse_time)
-                self._parking_escape_turn = self.parking_obstacle_turn
-                want_speed = float(self.parking_reverse_speed)
-                want_turn = 0.0
-                self.filtered_speed = want_speed
-                self.filtered_turn = 0.0
+            if self.parking_obstacle_stop:
+                # Too close: do not reverse and do not freeze forever. Creep
+                # slowly with strong avoidance turn to clear the obstacle.
+                # This still avoids collision because speed is very low.
+                want_speed = min(want_speed, 0.06)
+                want_turn = self.parking_obstacle_turn
+                self.filtered_speed = min(self.filtered_speed, 0.06)
                 if self.debug_log and self._tick % 15 == 0:
                     self.get_logger().warn(
-                        f"[ParkingObstacle] HIT/TOO CLOSE -> REVERSE front={self.parking_front_min:.2f}m "
+                        f"[ParkingObstacle] CLOSE AVOID front={self.parking_front_min:.2f}m "
                         f"L={self.parking_front_left_min:.2f}m "
                         f"R={self.parking_front_right_min:.2f}m "
-                        f"escape_turn={self._parking_escape_turn:+.2f}"
+                        f"turn={want_turn:+.2f} speed={want_speed:.2f}"
                     )
+            # If obstacle is only in the warning band, do NOT slow down.
+            # Wall alignment/lane guard will continue to keep the buggy safe.
         # ---- Wall-parallel alignment steering ----
         # Do NOT add wall alignment on top of a hard stop, otherwise it can fight
         # the escape/avoidance turn when the nose is too close to the hospital.
         if (self.mission_state == MissionState.ENTERING_SAFE_ZONE
                 and self._wall_align_valid
-                and not self.parking_obstacle_stop
-                and self._parking_recovery_phase == "NONE"):
+                and not self.parking_obstacle_stop):
             want_turn = max(TURN_MIN, min(TURN_MAX,
                 want_turn + self.wall_align_sign * self.wall_align_gain * self._wall_align_error))
 
@@ -1568,8 +1646,7 @@ class LineFollower(Node):
         self.filtered_speed = self.speed_alpha * want_speed + (1.0 - self.speed_alpha) * self.filtered_speed
 
         final_turn = max(TURN_MIN, min(TURN_MAX, self.filtered_turn))
-        min_speed_allowed = -1.0 if self.mission_state == MissionState.ENTERING_SAFE_ZONE else SPEED_MIN
-        final_speed = max(min_speed_allowed, min(SPEED_MAX, self.filtered_speed))
+        final_speed = max(SPEED_MIN, min(SPEED_MAX, self.filtered_speed))
 
         self.publish_drive_cmd(final_speed, self.steer_sign * final_turn)
 
@@ -1603,11 +1680,11 @@ class LineFollower(Node):
             self._log_zone_debug(now)
 
         close_count = self._zone_close_count
-        threshold = self.zone_close_beam_threshold
+        threshold = self._zone_active_threshold
 
         if close_count >= threshold:
             self._zone_consecutive_scans += 1
-            if self._zone_consecutive_scans >= self.zone_confirm_scans:
+            if self._zone_consecutive_scans >= self._zone_active_confirm_scans:
                 self._zone_detection_state = "DETECTED"
             else:
                 self._zone_detection_state = "CANDIDATE"
@@ -1615,17 +1692,17 @@ class LineFollower(Node):
             self.get_logger().info(
                 f"[SafeZone] {self._zone_detection_state}  "
                 f"close={close_count}/{threshold} beams  "
-                f"consecutive={self._zone_consecutive_scans}/{self.zone_confirm_scans}  "
+                f"consecutive={self._zone_consecutive_scans}/{self._zone_active_confirm_scans}  "
                 f"valid={self._zone_total_valid}  min={self._zone_min_dist:.2f}m"
             )
 
-            if self._zone_consecutive_scans >= self.zone_confirm_scans:
+            if self._zone_consecutive_scans >= self._zone_active_confirm_scans:
                 self._on_safe_zone_detected()
         else:
             if self._zone_consecutive_scans > 0:
                 self.get_logger().info(
                     f"[SafeZone] MISS — streak reset  close={close_count}/{threshold} beams  "
-                    f"(needed {self.zone_confirm_scans} consecutive scans)"
+                    f"(needed {self._zone_active_confirm_scans} consecutive scans)"
                 )
             self._zone_consecutive_scans = 0
             self._zone_detection_state = "MISS"
@@ -1663,8 +1740,8 @@ class LineFollower(Node):
             "SAFE ZONE DETECTED\n"
             f"Target type   : {self.active_target_type}\n"
             f"Park distance : {self._target_parking_distance():.2f} m\n"
-            f"Close beams   : {self._zone_close_count} (threshold {self.zone_close_beam_threshold})\n"
-            f"Consecutive   : {self.zone_confirm_scans} scans\n"
+            f"Close beams   : {self._zone_close_count} (threshold {self._zone_active_threshold})\n"
+            f"Consecutive   : {self._zone_active_confirm_scans} scans\n"
             f"Total valid   : {self._zone_total_valid} beams\n"
             f"Min distance  : {self._zone_min_dist:.2f}m\n"
             "Entering Safe Zone...\n"
@@ -1673,7 +1750,7 @@ class LineFollower(Node):
 
         self._transition_mission_state(
             MissionState.ENTERING_SAFE_ZONE,
-            f"Safe zone detected (close beams {self._zone_close_count}/{self.zone_close_beam_threshold}, "
+            f"Safe zone detected (close beams {self._zone_close_count}/{self._zone_active_threshold}, "
             f"type={self.active_target_type}, park_dist={self._target_parking_distance():.2f}m)"
         )
 
@@ -1868,12 +1945,16 @@ class LineFollower(Node):
         return "PATIENT" in self._target_text()
 
     def _target_parking_distance(self):
-        """Return parking forward distance.
+        """Return parking forward distance based on target type.
 
-        Patient and hospital now use the SAME parking distance/logic.
-        Keep the separate params declared for live tuning/backward
-        compatibility, but do not automatically make hospital drive deeper.
+        PATIENT stays at the normal distance that is working well.
+        HOSPITAL drives a little deeper so the buggy is not parked with
+        its tail at the edge of the hospital zone.
         """
+        if self._is_hospital_target():
+            return float(self.parking_forward_distance_hospital)
+        if self._is_patient_target():
+            return float(self.parking_forward_distance_patient)
         return float(self.parking_forward_distance)
 
     def _forward_speed_estimate(self):
@@ -2029,10 +2110,10 @@ class LineFollower(Node):
             f"Total beams  : {total_count}\n"
             f"Valid beams  : {valid_count}\n"
             f"Close beams  : {close_count}/{threshold}  "
-            f"(band {self.zone_close_min_dist:.2f}–{self.zone_close_max_dist:.2f} m)\n"
+            f"(band {self._zone_active_close_min:.2f}–{self._zone_active_close_max:.2f} m)\n"
             f"Min distance : {fmt(min_dist)}\n"
             f"Detection    : {self._zone_detection_state}  "
-            f"(consecutive {self._zone_consecutive_scans}/{self.zone_confirm_scans})\n"
+            f"(consecutive {self._zone_consecutive_scans}/{self._zone_active_confirm_scans})\n"
             f"Target type  : {self.active_target_type if self.active_target_type else 'NONE'}\n"
             f"Park dist    : {self._target_parking_distance():.2f} m\n"
             f"FSM state    : {self.mission_state}\n"
