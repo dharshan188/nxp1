@@ -17,6 +17,7 @@ from rclpy.node import Node
 from rclpy.parameter import Parameter
 from sensor_msgs.msg import CompressedImage
 from std_msgs.msg import String
+from collections import deque
 import cv2
 import numpy as np
 
@@ -42,6 +43,16 @@ MIN_DETECT_BOARD_WIDTH = 180
 MIN_DETECT_BOARD_HEIGHT = 48
 MIN_BOARD_AREA = 1200
 
+# Minimum board width to TRUST a read for locking. The board is still DETECTED
+# early (MIN_DETECT_BOARD_WIDTH) for tracking, but a vote is only cast once the
+# board is close enough (this width) that the arrow is reliably readable.
+# Far / mid-range reads are degraded and wrong, and they cause the
+# LEFT<->RIGHT<->STRAIGHT oscillation + premature locks (e.g. locking a
+# transitional RIGHT before the true STRAIGHT appears closer up). Gating votes
+# by closeness removes them. TUNE PER COURSE: raise if it locks a wrong /
+# transitional direction (wait for closer), lower if it abstains too much.
+MIN_LOCK_BOARD_WIDTH = 220
+
 # When multiple boards are visible, do not choose the highest-confidence arrow
 # from any board in the image. That can pick a side/old board. Choose the board
 # that is in front of the robot: near image center and reasonably large.
@@ -64,7 +75,7 @@ GREEN_HSV_HIGH = np.array([95, 255, 255])
 # Arrow extraction / classification tuning.
 #
 # These signs place the arrow at two different vertical positions:
-#   * lower cell       -> ARROW_Y0_RATIO .. ARROW_Y1_RATIO
+#   * lower cell        -> ARROW_Y0_RATIO .. ARROW_Y1_RATIO
 #   * upper-middle cell -> ARROW_UPPER_Y0 .. ARROW_UPPER_Y1
 # read_arrow_direction() tries BOTH windows and keeps the confident read. A
 # single fixed window matched only one layout (39%); the dual window hits both.
@@ -73,7 +84,6 @@ ARROW_Y1_RATIO = 0.96
 ARROW_UPPER_Y0 = 0.30
 ARROW_UPPER_Y1 = 0.55
 ARROW_X_MARGIN_RATIO = 0.07
-
 WHITE_HSV_LOW = np.array([0, 0, 115])
 WHITE_HSV_HIGH = np.array([180, 125, 255])
 
@@ -94,37 +104,44 @@ ARROW_MIN_PIXELS = 200
 # Straight must be REALLY vertical/narrow. Earlier value 1.45 caused broken
 # LEFT/RIGHT arrow fragments to be called STRAIGHT at mid range.
 STRAIGHT_ASPECT_MAX = 1.05
-
 # Treat moderate-width blobs as horizontal arrows; if centroid is weak they
 # will be skipped instead of guessed.
 HORIZONTAL_ASPECT_MIN = 1.20
 DIR_ASYM_DEAD_ZONE = 0.10
 DIR_ASYM_STRONG = 0.25
-
 # Horizontal LEFT/RIGHT decision. Centroid is more stable than row-extents at
 # mid/far range. Negative centroid offset = LEFT, positive = RIGHT.
 CENTROID_DEAD_ZONE = 0.025
 CENTROID_STRONG = 0.055
-
 # Do not accept weak STRAIGHT reads. False A/B straight mistakes were
 # low-confidence (~0.82). Real straight arrows in samples score >0.90, so weak
 # STRAIGHT reads are ignored.
 STRAIGHT_ACCEPT_CONF = 0.90
-
 DEFAULT_CONFIDENCE_THRESHOLD = 0.90
 DEFAULT_REQUIRED_CONSECUTIVE = 5
 
-# Mission mapping for /target_qr (replaces Municipality Server dest parsing)
+# Temporal lock: a SLIDING WINDOW of recent reads decides the lock, not a
+# running total. Early far-range wrong reads fall out of the window so the
+# close-range correct read can win. A lock needs a FULL window AND a clear
+# supermajority; if the approach oscillates ~50/50 no direction wins, so it
+# abstains (no wrong lock). VOTE_WINDOW = number of recent votes kept;
+# VOTE_SUPERMAJORITY = winner's required share of the window.
+VOTE_WINDOW = 8
+VOTE_SUPERMAJORITY = 0.66
+
+# Mission mapping for /mission/available (replaces Municipality Server dest parsing)
 PATIENT_QR_TO_GOAL = {
     "PATIENT_1": "A",
     "PATIENT_2": "B",
     "PATIENT_3": "C",
 }
+
 HOSPITAL_QR_TO_GOAL = {
     "HOSPITAL_1": "X",
     "HOSPITAL_2": "Y",
     "HOSPITAL_3": "Z",
 }
+
 TARGET_QR_TO_GOAL = {**PATIENT_QR_TO_GOAL, **HOSPITAL_QR_TO_GOAL}
 
 
@@ -248,7 +265,6 @@ def select_arrow_component(mask):
     kept_any = False
     best_score = 0.0
     best_id = None
-
     for cid in range(1, n_labels):
         area = int(stats[cid, cv2.CC_STAT_AREA])
         x, y, bw, bh = stats[cid, 0:4]
@@ -295,7 +311,6 @@ def select_arrow_component(mask):
         # as a STRAIGHT arrow at mid range.
         if cy < 0.18 * h:
             continue
-
         selected[labels == cid] = 255
         kept_any = True
         bbox_area = float(bw * bh)
@@ -305,12 +320,10 @@ def select_arrow_component(mask):
         if score > best_score:
             best_score = score
             best_id = cid
-
     if kept_any:
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         selected = cv2.morphologyEx(selected, cv2.MORPH_CLOSE, kernel, iterations=1)
         return selected
-
     # Fallback: keep best component if everything was filtered too hard.
     if best_id is not None:
         selected[labels == best_id] = 255
@@ -322,23 +335,19 @@ def classify_arrow_mask(mask):
     ys, xs = np.where(mask > 0)
     if xs.size < 20 or ys.size < 20:
         return None, 0.0
-
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     bw = x1 - x0 + 1
     bh = y1 - y0 + 1
     if bw < 7 or bh < ARROW_MIN_HEIGHT:
         return None, 0.0
-
     aspect = bw / float(bh + 1e-6)
     pixels = int(xs.size)
-
     # Quality gate: a reliable arrow has enough mass. Tiny/degraded blobs (far
     # range, blur) score high confidence but are wrong -> reject ("in doubt,
     # leave it") so a direction is only emitted when the arrow is substantial.
     if pixels < ARROW_MIN_PIXELS:
         return None, 0.0
-
     sub = (mask[y0:y1 + 1, x0:x1 + 1] > 0).astype(np.uint8)
     col_counts = sub.sum(axis=0).astype(np.float32)
     row_counts = sub.sum(axis=1).astype(np.float32)
@@ -387,7 +396,6 @@ def classify_arrow_mask(mask):
     )
     if not horizontal_like:
         return None, 0.0
-
     # Centroid relative to bbox center is stable for left/right on this board.
     bbox_center_x = 0.5 * (x0 + x1)
     centroid_x = float(xs.mean())
@@ -405,11 +413,11 @@ def classify_arrow_mask(mask):
 def read_arrow_direction(cell, debug=False):
     """Read one cell's arrow, trying both vertical layouts and keeping the
     most confident classification. Contaminated (flooded) ROIs are rejected.
+
     Returns (direction, confidence); direction is None if no reliable read.
     """
     best = (None, 0.0)
     best_artifacts = None
-
     for y0_ratio, y1_ratio in (
         (ARROW_UPPER_Y0, ARROW_UPPER_Y1),   # upper-middle layout
         (ARROW_Y0_RATIO, ARROW_Y1_RATIO),   # lower layout
@@ -420,23 +428,19 @@ def read_arrow_direction(cell, debug=False):
         arrow = select_arrow_component(mask)
         if arrow is None:
             continue
-
         # Flood-guard: one arrow cannot fill most of the ROI -> contaminated.
         if arrow.size and (arrow.sum() / 255.0) / arrow.size > ARROW_FILL_MAX:
             continue
-
         direction, confidence = classify_arrow_mask(arrow)
         if direction is not None and confidence > best[1]:
             best = (direction, confidence)
             best_artifacts = (roi, mask, arrow)
-
     if debug and best_artifacts is not None:
         roi, mask, arrow = best_artifacts
         cv2.imshow("arrow_roi", roi)
         cv2.imshow("arrow_mask", mask)
         cv2.imshow("arrow_selected", arrow)
         cv2.waitKey(1)
-
     return best
 
 
@@ -541,18 +545,22 @@ class ObjectRecognizer(Node):
         self.declare_parameter('confidence_threshold', DEFAULT_CONFIDENCE_THRESHOLD)
         self.declare_parameter('required_consecutive', DEFAULT_REQUIRED_CONSECUTIVE)
         self.declare_parameter('exit_missing_frames', EXIT_MISSING_FRAMES_MAX)
+        self.declare_parameter('min_lock_board_width', MIN_LOCK_BOARD_WIDTH)
 
         initial_goal = self.get_parameter('goal_letter').get_parameter_value().string_value.upper()
         self.goal_letter = initial_goal if initial_goal in LETTER_ORDER else 'A'
         self.goal_valid = True
         self._last_param_goal = self.goal_letter
 
-        self.prev_direction = None
-        self.consecutive_count = 0
-        self.skip_count = 0
         self.mission_locked = False
         self.current_mission = None
         self.missing_frames = 0
+
+        # Temporal vote window for the current approach. A sliding window (not a
+        # running total) so early far-range wrong reads fall off and the
+        # close-range correct read can win; a lock needs a full window + a
+        # clear supermajority.
+        self.vote_window = deque(maxlen=VOTE_WINDOW)
 
         # Mission target cache (replaces Municipality Server).
         # latest_target_qr holds the CANONICAL target (from /mission/available)
@@ -571,7 +579,7 @@ class ObjectRecognizer(Node):
         # every new mission is received immediately after Municipality
         # assignment via /mission/available.  The QR Detector publishes this
         # topic at assignment time with the target QR payload (e.g. PATIENT_2).
-        # The detector does NOT depend on /target_qr for goal updates —
+        # The detector does NOT depend on /target_qr for goal updates -
         # /target_qr (Purpose 2) is only published after the QR is verified and
         # is consumed by the Line Follower, not by this node.
         self.subscription_mission_available = self.create_subscription(
@@ -596,13 +604,11 @@ class ObjectRecognizer(Node):
         previous mission so the detector can never continue searching for an
         old goal.
         """
-        self.prev_direction = None
-        self.consecutive_count = 0
-        self.skip_count = 0
         self.current_mission = None
         self.missing_frames = 0
         self.mission_locked = False
         self.goal_valid = True
+        self.vote_window.clear()
 
     def _set_goal(self, new_goal, source):
         if new_goal is None or new_goal not in LETTER_ORDER:
@@ -647,11 +653,12 @@ class ObjectRecognizer(Node):
             PATIENT_1->A, PATIENT_2->B, PATIENT_3->C,
             HOSPITAL_1->X, HOSPITAL_2->Y, HOSPITAL_3->Z
 
-        A duplicate mission (same target as the current one) is ignored —
+        A duplicate mission (same target as the current one) is ignored -
         no reset, no stale goal.
         """
         if msg is None or not msg.data:
             return
+
         raw_qr = msg.data.strip()
         qr_upper = raw_qr.strip().upper()
 
@@ -694,9 +701,8 @@ class ObjectRecognizer(Node):
         old_goal = self.goal_letter
 
         # Discard the previous mission completely.
-        self._reset_detection_state()   # clears prev_direction, consecutive_count,
-                                        # skip_count, current_mission, missing_frames,
-                                        # mission_locked, goal_valid
+        self._reset_detection_state()   # clears current_mission, missing_frames,
+                                        # mission_locked, goal_valid, vote tally
 
         # Assign the new mapped goal.
         self.goal_letter = mapped_goal
@@ -733,15 +739,14 @@ class ObjectRecognizer(Node):
             f"Searching for Goal {mapped_goal}...\n"
             "========================================\n"
         )
+
         if old_goal != mapped_goal:
             self.get_logger().info(
                 f"Goal changed: {old_goal} -> {mapped_goal} from {raw_qr} (type {target_type}). "
-                f"Previous mission lock cleared, consecutive count reset, board exit counter reset."
-            )
+                f"Previous mission lock cleared, vote tally reset, board exit counter reset.")
         else:
             self.get_logger().info(
-                f"Goal {mapped_goal} reconfirmed from {raw_qr}. Detector reset for fresh search."
-            )
+                f"Goal {mapped_goal} reconfirmed from {raw_qr}. Detector reset for fresh search.")
 
     def _check_parameter_goal(self):
         """
@@ -792,13 +797,14 @@ class ObjectRecognizer(Node):
         min_w = self.get_parameter('min_board_width').get_parameter_value().integer_value
         min_h = self.get_parameter('min_board_height').get_parameter_value().integer_value
         conf_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
-        required_consecutive = self.get_parameter('required_consecutive').get_parameter_value().integer_value
+        required_votes = self.get_parameter('required_consecutive').get_parameter_value().integer_value
 
         board_reads = read_boards(image)
+
         if not board_reads:
-            self.prev_direction = None
-            self.consecutive_count = 0
-            self.skip_count = 0
+            # Board gone -> start a fresh vote window for the next board.
+            if self.vote_window:
+                self.vote_window.clear()
             self.get_logger().info("No mid-range board detected.", throttle_duration_sec=2.0)
             return
 
@@ -806,6 +812,7 @@ class ObjectRecognizer(Node):
         # the forward/center board. This avoids a side board with high confidence
         # changing the mission.
         target_board = select_target_board(board_reads, image.shape)
+
         best = None
         if target_board is not None:
             x0, y0, x1, y1 = target_board["bbox"]
@@ -824,18 +831,11 @@ class ObjectRecognizer(Node):
                     }
 
         if best is None:
-            self.skip_count += 1
-            if self.skip_count > SKIP_MISSING_FRAMES_MAX:
-                self.prev_direction = None
-                self.consecutive_count = 0
-                self.skip_count = 0
-                self.get_logger().info(
-                    f"Goal '{self.goal_letter}' not read on any visible board. Streak reset.",
-                    throttle_duration_sec=1.0)
-            else:
-                self.get_logger().info(
-                    f"Goal '{self.goal_letter}' not read on this frame. Keeping streak {self.consecutive_count}; skip {self.skip_count}/{SKIP_MISSING_FRAMES_MAX}.",
-                    throttle_duration_sec=1.0)
+            # No reliable read this frame (quality gate rejected it, or goal
+            # cell not found). Do NOT reset the window - just skip voting.
+            self.get_logger().info(
+                f"Goal '{self.goal_letter}' not read this frame. window={dict(self._window_tally())}",
+                throttle_duration_sec=1.0)
             return
 
         direction = best["direction"]
@@ -843,56 +843,67 @@ class ObjectRecognizer(Node):
         board_w = best["board_w"]
         board_h = best["board_h"]
 
+        # Closeness gate: do NOT vote until the board is close enough to read
+        # reliably. Far / mid-range reads are degraded and wrong; voting on them
+        # is what causes the oscillation and premature (transitional) locks.
+        min_lock_w = self.get_parameter('min_lock_board_width').get_parameter_value().integer_value
+        if board_w < min_lock_w:
+            self.get_logger().info(
+                f"Board {board_w}x{board_h} below min_lock_board_width={min_lock_w}; "
+                f"waiting for closer approach (no vote). window={dict(self._window_tally())}",
+                throttle_duration_sec=1.0)
+            return
+
         if confidence < conf_threshold:
-            self.skip_count += 1
-            if self.skip_count > SKIP_MISSING_FRAMES_MAX:
-                self.prev_direction = None
-                self.consecutive_count = 0
-                self.skip_count = 0
-                self.get_logger().info(
-                    f"Ignoring {direction}: confidence = {confidence:.2f}, threshold = {conf_threshold:.2f}. Streak reset.",
-                    throttle_duration_sec=1.0)
-            else:
-                self.get_logger().info(
-                    f"Ignoring {direction}: confidence = {confidence:.2f}, threshold = {conf_threshold:.2f}. Keeping streak {self.consecutive_count}; skip {self.skip_count}/{SKIP_MISSING_FRAMES_MAX}.",
-                    throttle_duration_sec=1.0)
+            self.get_logger().info(
+                f"Ignoring {direction}: confidence = {confidence:.2f}, threshold = {conf_threshold:.2f}. window={dict(self._window_tally())}",
+                throttle_duration_sec=1.0)
             return
 
-        self.skip_count = 0
-        if direction == self.prev_direction:
-            self.consecutive_count += 1
-        else:
-            if self.prev_direction is not None:
-                self.get_logger().info(
-                    f"Candidate changed: {self.prev_direction} -> {direction}")
-            self.prev_direction = direction
-            self.consecutive_count = 1
-
+        # ---- VOTE: push into a SLIDING WINDOW of recent reads ----
+        # A sliding window (not a running total) so early far-range wrong reads
+        # fall off and the close-range correct read can reach a supermajority.
+        self.vote_window.append(direction)
+        counts = self._window_tally()
+        top_dir = max(counts, key=counts.get)
+        top_n = counts[top_dir]
+        win_n = len(self.vote_window)
         boards_seen = best.get("boards_seen", len(board_reads))
+
         self.get_logger().info(
-            f"Detected {direction}  goal={self.goal_letter}  conf={confidence:.2f}  "
+            f"Vote {direction}  goal={self.goal_letter}  conf={confidence:.2f}  "
             f"board={board_w}x{board_h}  boards_seen={boards_seen}  "
-            f"consecutive={self.consecutive_count}/{required_consecutive}")
+            f"| window={dict(counts)}  top={top_dir}={top_n}/{win_n}")
 
-        if self.consecutive_count < required_consecutive:
-            return
+        # ---- LOCK: only on a FULL window with a clear supermajority ----
+        # Full-window requirement prevents locking on a short early wrong run;
+        # the supermajority prevents locking on genuine oscillation.
+        if (win_n >= VOTE_WINDOW and
+                top_n >= required_votes and
+                top_n >= VOTE_SUPERMAJORITY * win_n):
 
-        self.current_mission = direction
-        self.mission_locked = True
-        self.missing_frames = 0
+            self.current_mission = top_dir
+            self.mission_locked = True
+            self.missing_frames = 0
 
-        msg = String()
-        msg.data = direction
-        self.publisher_turn.publish(msg)
+            msg = String()
+            msg.data = top_dir
+            self.publisher_turn.publish(msg)
 
-        self.get_logger().info(
-            f"MISSION LOCKED\n"
-            f"Goal: {self.goal_letter}\n"
-            f"Direction: {direction}\n"
-            f"Confidence: {confidence:.2f}\n"
-            f"Board size: {board_w} x {board_h}\n"
-            f"Consecutive frames: {self.consecutive_count}\n"
-            f"State: WAIT_BOARD_EXIT")
+            self.get_logger().info(
+                f"MISSION LOCKED\n"
+                f"Goal: {self.goal_letter}\n"
+                f"Direction: {top_dir}\n"
+                f"Confidence (last): {confidence:.2f}\n"
+                f"Board size: {board_w} x {board_h}\n"
+                f"Vote window: {dict(counts)}  (winner {top_n}/{win_n})\n"
+                f"State: WAIT_BOARD_EXIT")
+
+    def _window_tally(self):
+        counts = {"LEFT": 0, "RIGHT": 0, "STRAIGHT": 0}
+        for v in self.vote_window:
+            counts[v] = counts.get(v, 0) + 1
+        return counts
 
 
 def main(args=None):
