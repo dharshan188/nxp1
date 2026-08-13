@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import re
+import time
 
 import rclpy
 from rclpy.node import Node
@@ -77,6 +78,9 @@ GOAL_TO_HOSPITAL_NUM = {"X": 4, "Y": 5, "Z": 6}
 
 VALID_MISSION_PAYLOADS = {"A", "B", "C", "X", "Y", "Z", "OK", "INVALID"}
 
+# Frames in a row without the verified QR before we say it left the camera.
+QR_GONE_CONFIRM_FRAMES = 6
+
 # ---------------------------------------------------------------------------
 # MISSION FINITE STATE MACHINE  (UNCHANGED)
 # ---------------------------------------------------------------------------
@@ -94,24 +98,28 @@ FSM_SEND_PACKET = "SEND_PACKET"
 
 class QRDetector(Node):
     """
-    QR Detector - simplified mission execution.
+    QR Detector - file 2 topics + file 1 final-mission PARKED protocol.
 
-    The QR detector is a VALIDATOR ONLY:
-      - It reads the camera and decodes QR codes.
-      - It compares a detected QR against the expected QR of the currently
-        assigned mission.
-      - A wrong QR is ignored (no stop, no slow, no publish).
-      - A correct QR is stored once, published once, then parking proceeds.
-      - It owns the Municipality communication (send packet / wait ACK / retry).
+    File 2 topics (all preserved):
+      Sub: /camera/image_raw/compressed
+      Sub: /safe_zone
+      Sub: /target_type          (loopback, log only)
+      Sub: /target_qr            (loopback, log only)
+      Sub: /ServerCommunication
+      Sub: /mission/turn         (log only)
+      Pub: /qr_detection
+      Pub: /target_qr
+      Pub: /target_type
+      Pub: /resume_line_following
+      Pub: /mission/available
+      Pub: /ServerCommunication
 
-    The communication protocol (ROS topics, Municipality packet fields,
-    src/dest IDs, UID, ACK, retry, timeouts) is unchanged.
+    Extra (does not replace any file-2 topic):
+      Pub: /qr_not_visible       (Bool, like /safe_zone — last matching QR left)
 
-    NOTE (simplification): only the QR *vision pipeline* was simplified.
-    The detection strategy is identical (pyzbar first, OpenCV fallback,
-    stop at first success), but the old 9-variant preprocessing grid was
-    reduced to 3 well-chosen grayscale variants, and unused duplicate
-    filtering state was removed.
+    File 1 protocol added:
+      Final hospital (goal Z): /safe_zone=True sends "PARKED" once
+      instead of the goal letter. Every other mission still sends A/B/C/X/Y.
     """
 
     def __init__(self):
@@ -129,18 +137,12 @@ class QRDetector(Node):
         # -----------------------------------------------------------------
         # SINGLE SOURCE OF TRUTH: the current mission.
         # -----------------------------------------------------------------
-        # Mission finite state machine (no WAIT_ASSIGNMENT after startup).
-        # The initial mission is Goal A -> PATIENT_1, so the node starts
-        # immediately in SEARCHING_QR.
         self.fsm_state = FSM_SEARCHING_QR
 
-        # Expected target of the currently assigned mission (stored on
-        # Municipality assignment; used only for QR validation).
         self.current_goal = "A"
         self.expected_qr = GOAL_TO_PATIENT_NAME[self.current_goal]  # "PATIENT_1"
         self.expected_target_type = "PATIENT"
 
-        # Current mission bookkeeping (single set of flags).
         self.mission_state = MISSION_PATIENT
         self.current_patient = GOAL_TO_PATIENT_NAME[self.current_goal]
         self.current_patient_id = GOAL_TO_PATIENT_NUM[self.current_goal]
@@ -151,6 +153,19 @@ class QRDetector(Node):
         # QR verification (one source of truth: qr_verified).
         self.qr_verified = False
         self.verified_qr = None
+
+        # File 1 leftover flag (Z no longer auto-PARKED; bonus does).
+        self.parked_sent = False
+
+        # Bonus: count each completed pick/drop (A,X,B,Y,C,Z) up to 6.
+        self.mission_leg_count = 0
+        self._completed_legs = set()
+        self.bonus_active = False
+        self.bonus_ok = False
+        self._last_parked_send = None
+
+        # Visibility of the successfully-verified QR (print + /qr_not_visible).
+        self._reset_verified_visibility()
 
         # -----------------------------------------------------------------
         # Communication state machine (ACK / retry / UID) - unchanged.
@@ -175,7 +190,7 @@ class QRDetector(Node):
             "==========================================\n"
         )
 
-        # ------------------- ROS plumbing (unchanged topics) -------------
+        # ------------------- ROS plumbing (file 2 topics, all kept) ------
         self.subscription_camera = self.create_subscription(
             CompressedImage,
             '/camera/image_raw/compressed',
@@ -222,6 +237,14 @@ class QRDetector(Node):
             String, '/mission/turn', self.mission_turn_callback, 10)
         self.get_logger().info("Subscribed:\n    /mission/turn")
 
+        # Extra publisher (file 2 topics untouched). Line follower parks on this.
+        self.publisher_qr_not_visible = self.create_publisher(
+            Bool, '/qr_not_visible', 10)
+        self.get_logger().info("Publisher Ready:\n    /qr_not_visible")
+
+        self.publisher_bonus = self.create_publisher(String, '/bonus', 10)
+        self.get_logger().info("Publisher Ready:\n    /bonus")
+
         # --- QR vision resources (created once, reused per frame) --------
         self.qr_detector = cv2.QRCodeDetector()
         self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
@@ -230,6 +253,7 @@ class QRDetector(Node):
             self.get_logger().warn("pyzbar not available. Falling back to cv2.QRCodeDetector only.")
 
         self.comm_timer = self.create_timer(0.1, self._communication_timeout_check)
+        self.bonus_timer = self.create_timer(0.5, self._bonus_parked_tick)
 
         self.get_logger().info("QR Detector Node started. Waiting for images...")
         self.get_logger().info(
@@ -240,6 +264,7 @@ class QRDetector(Node):
             f"Comm State    : {self.comm_state}\n"
             f"FSM State     : {self.fsm_state}\n"
             "Protocol: src=1 dest=2 for buggy->server, src=2 dest=1 for server->buggy\n"
+            "Final mission (goal Z) sends PARKED on /safe_zone (once).\n"
             "====================================")
 
         self._log_counters("NODE STARTUP - SEARCHING_QR")
@@ -270,6 +295,68 @@ class QRDetector(Node):
         """The mission is active while we are searching / verified / waiting ACK."""
         return self.fsm_state in (FSM_SEARCHING_QR, FSM_QR_VERIFIED, FSM_SEND_PACKET)
 
+    def _is_final_mission(self):
+        """True only for the last hospital delivery in the chain
+        (A->X->B->Y->C->Z->OK). Goal "Z" is the final leg before
+        MISSION_COMPLETE, so that is the point where /safe_zone=True
+        should be converted into the "PARKED" protocol message instead
+        of the normal goal-letter packet."""
+        return (self.mission_state == MISSION_HOSPITAL
+                and self.current_goal == "Z")
+
+    def _note_leg_complete(self, goal):
+        """Patient pick or hospital drop. 6 legs → bonus."""
+        goal = str(goal or "").strip().upper()
+        if goal not in ("A", "B", "C", "X", "Y", "Z"):
+            return
+        if goal in self._completed_legs:
+            return
+        self._completed_legs.add(goal)
+        self.mission_leg_count = len(self._completed_legs)
+        kind = ("patient pick" if goal in ("A", "B", "C")
+                else "hospital drop")
+        banner = (
+            f"*** LEG {self.mission_leg_count}/6  {kind}  goal={goal}\n"
+            f"    done={sorted(self._completed_legs)}")
+        self.get_logger().info(banner)
+        print(banner, flush=True)
+        if self.mission_leg_count >= 6:
+            self._start_bonus()
+
+    def _start_bonus(self):
+        if self.bonus_active or self.bonus_ok:
+            return
+        self.bonus_active = True
+        self.bonus_ok = False
+        self._last_parked_send = None
+        msg = String()
+        msg.data = "BONUS"
+        self.publisher_bonus.publish(msg)
+        banner = (
+            "==========================================\n"
+            "BONUS  all 6 legs done (3 pick + 3 drop)\n"
+            "Published /bonus = BONUS\n"
+            "Line follower: 2-lane reverse+straight park\n"
+            "Then PARKED to server every 4 s until OK\n"
+            "==========================================")
+        self.get_logger().info(banner)
+        print(banner, flush=True)
+
+    def _bonus_parked_tick(self):
+        """While bonus is active, send PARKED every 4 s (multiples allowed)."""
+        if not self.bonus_active or self.bonus_ok:
+            return
+        now = time.time()
+        if (self._last_parked_send is not None and
+                now - self._last_parked_send < 4.0):
+            return
+        if self.comm_state == COMM_WAITING_ACK:
+            return
+        self.get_logger().info(
+            "BONUS: publishing PARKED to /ServerCommunication")
+        self.send_mission_to_server("PARKED")
+        self._last_parked_send = now
+
     def _log_counters(self, context=""):
         self.get_logger().info(
             f"\n==========================================\n"
@@ -284,6 +371,9 @@ class QRDetector(Node):
             f"FSM: {self.fsm_state} | Comm: {self.comm_state}\n"
             f"Expected QR: {self.expected_qr} | Verified: {self.verified_qr} "
             f"(qr_verified={self.qr_verified})\n"
+            f"Legs done: {self.mission_leg_count}/6 "
+            f"{sorted(self._completed_legs)}\n"
+            f"Bonus: active={self.bonus_active} ok={self.bonus_ok}\n"
             f"==========================================\n"
         )
 
@@ -301,9 +391,89 @@ class QRDetector(Node):
             return match.group(1).upper()
         return None
 
+    def _normalize_decoded_qr(self, qr_data):
+        if not qr_data:
+            return None
+        raw = str(qr_data).strip()
+        if not raw:
+            return None
+        detected_patient = self._extract_patient_name(raw)
+        detected_hospital = self._extract_hospital_name(raw)
+        return detected_patient or detected_hospital or raw.upper()
+
+    def _reset_verified_visibility(self):
+        self._verified_visible = False
+        self._verified_lost_frames = 0
+        self._verified_seen_frames = 0
+        self._verified_first_seen_time = None
+        self._verified_last_seen_time = None
+        self._verified_last_seen_stamp = None
+        self._verified_not_visible_logged = False
+        if hasattr(self, 'publisher_qr_not_visible'):
+            self._publish_qr_not_visible(False)
+
+    def _publish_qr_not_visible(self, gone):
+        if not hasattr(self, 'publisher_qr_not_visible'):
+            return
+        msg = Bool()
+        msg.data = bool(gone)
+        try:
+            self.publisher_qr_not_visible.publish(msg)
+            self.get_logger().info(
+                f"Publishing /qr_not_visible: {bool(gone)}")
+        except Exception as e:
+            self.get_logger().error(f"/qr_not_visible publish failed: {e}")
+
+    def _note_verified_qr_seen(self):
+        now = time.time()
+        if self._verified_first_seen_time is None:
+            self._verified_first_seen_time = now
+        self._verified_visible = True
+        self._verified_lost_frames = 0
+        self._verified_seen_frames += 1
+        self._verified_last_seen_time = now
+        self._verified_last_seen_stamp = self._get_timestamp_str()
+
+    def _update_verified_qr_visibility(self, qr_data):
+        """After a successful match, publish once when that QR leaves camera."""
+        if not self.qr_verified or not self.verified_qr:
+            return
+
+        detected = self._normalize_decoded_qr(qr_data)
+        if detected == self.verified_qr:
+            self._note_verified_qr_seen()
+            return
+
+        if self._verified_last_seen_time is None:
+            return
+        if self._verified_not_visible_logged:
+            return
+
+        self._verified_lost_frames += 1
+        if self._verified_lost_frames < QR_GONE_CONFIRM_FRAMES:
+            return
+
+        self._verified_visible = False
+        self._verified_not_visible_logged = True
+        gone_for = time.time() - self._verified_last_seen_time
+        banner = (
+            "==========================================\n"
+            "QR CODE NOT VISIBLE\n"
+            f"Verified QR     : {self.verified_qr}\n"
+            f"Target type     : {self.expected_target_type}\n"
+            f"Last QR seen    : {self._verified_last_seen_stamp}\n"
+            f"Gone for        : {gone_for:.2f} s  "
+            f"({self._verified_lost_frames} frames)\n"
+            f"Seen frames     : {self._verified_seen_frames}\n"
+            f"FSM             : {self.fsm_state}\n"
+            "This is the last successful scan leaving the camera.\n"
+            "==========================================")
+        self.get_logger().info("\n" + banner)
+        print(banner, flush=True)
+        self._publish_qr_not_visible(True)
+
     # ------------------------------------------------------------------
-    # Loopback observer callbacks (log only - the QR detector is a
-    # validator only and never reacts to its own publishes).
+    # Loopback observer callbacks (log only)
     # ------------------------------------------------------------------
     def target_type_callback(self, msg):
         self._log_ros_topic("/target_type", msg.data if msg else None)
@@ -329,11 +499,7 @@ class QRDetector(Node):
     # MISSION FLOW
     # ==================================================================
     def _assign_mission(self, target_type, target_qr):
-        """Step 1: Municipality assigns a mission.  Store expected target,
-        publish the goal to the object recognizer, resume line following,
-        reset verification.  Do NOT publish /target_qr or /target_type yet,
-        do NOT slow the buggy, do NOT enter parking mode, do NOT send to
-        Municipality.  Keeps the FSM in SEARCHING_QR."""
+        """Step 1: Municipality assigns a mission."""
         self.get_logger().info(
             f"\n==========================================\n"
             f"MUNICIPALITY ASSIGNMENT\n"
@@ -342,12 +508,10 @@ class QRDetector(Node):
             f"==========================================\n"
         )
 
-        # Store expected target.
         self.expected_target_type = target_type
         self.expected_qr = target_qr
         self.current_target_type_for_log = target_type
 
-        # Update the mission bookkeeping.
         if target_type == "PATIENT":
             self.mission_state = MISSION_PATIENT
             self.current_patient = target_qr
@@ -362,17 +526,12 @@ class QRDetector(Node):
                 HOSPITAL_NAME_TO_GOAL.get(target_qr, "X"), 4)
             self.current_goal = HOSPITAL_NAME_TO_GOAL.get(target_qr, self.current_goal)
 
-        # Reset all QR verification state for the new mission.
         self.qr_verified = False
         self.verified_qr = None
+        self._reset_verified_visibility()
 
-        # Publish the new goal to the object recognizer (navigation wake).
         self._publish_mission_available(target_qr)
-
-        # Resume line following if the buggy was previously stopped.
         self._publish_resume_line_following("RESUME")
-
-        # Enter SEARCHING_QR: scan for the correct QR only.
         self.fsm_state = FSM_SEARCHING_QR
 
         self.get_logger().info(
@@ -382,6 +541,7 @@ class QRDetector(Node):
             f"Expected QR : {self.expected_qr}\n"
             "qr_verified = False\n"
             f"FSM : {self.fsm_state}\n"
+            f"Final mission (PARKED on safe_zone): {self._is_final_mission()}\n"
             "Searching for the matching QR only...\n"
             "=================================="
         )
@@ -389,10 +549,7 @@ class QRDetector(Node):
         self._log_counters(f"After Assignment {target_qr}")
 
     def handle_qr_detection(self, qr_data):
-        """Step 3: validate the detected QR against the expected QR.
-        - Wrong QR: ignore, continue driving, no publish.
-        - Correct QR: store once, publish once, enter QR_VERIFIED.
-        """
+        """Step 3: validate the detected QR against the expected QR."""
         if self.fsm_state != FSM_SEARCHING_QR:
             self.get_logger().info(
                 f"QR ignored: {qr_data} - not searching (fsm={self.fsm_state})."
@@ -405,20 +562,15 @@ class QRDetector(Node):
             )
             return
 
-        # Normalise the detected QR.
-        detected_patient = self._extract_patient_name(qr_data)
-        detected_hospital = self._extract_hospital_name(qr_data)
-        detected = detected_patient or detected_hospital or str(qr_data).strip().upper()
+        detected = self._normalize_decoded_qr(qr_data)
 
         if detected != self.expected_qr:
-            # Wrong QR: ignore completely.
             self.get_logger().info(
                 f"Wrong {self.expected_target_type} Detected {detected} vs "
                 f"Assigned {self.expected_qr} - ignored. Continuing Search..."
             )
             return
 
-        # Correct QR: publish and verify exactly once.
         if self.qr_verified and self.verified_qr == detected:
             self.get_logger().info(
                 f"Duplicate QR ignored (already verified): {detected}"
@@ -427,26 +579,22 @@ class QRDetector(Node):
 
         self.qr_verified = True
         self.verified_qr = detected
+        self._note_verified_qr_seen()
 
         self.get_logger().info(
             f"\n----------------------------------\n"
             f"Correct {self.expected_target_type} Found via QR detection\n"
             f"Detected: {detected} Expected: {self.expected_qr}\n"
             f"QR VERIFIED : YES\n"
+            f"Watching camera until this QR is no longer visible...\n"
             f"NEXT ACTION: Publish target and enter parking mode\n"
             f"----------------------------------\n"
         )
 
-        # Publish the verified mission topics to the NAVIGATION layer exactly
-        # once.  These tells the line follower that the current QR is the
-        # correct target, so it slows and detects the safe zone.  They are NOT
-        # gated behind safe_zone or ACK — they belong to the navigation layer,
-        # not the communication layer.
         self._publish_target_qr(detected)
         self._publish_target_type(self.expected_target_type)
         self._publish_qr_detection(detected)
 
-        # Enter QR_VERIFIED: wait for /safe_zone.
         self.get_logger().info(
             f"FSM Transition: {self.fsm_state} -> {FSM_QR_VERIFIED}\n"
             "Waiting for /safe_zone..."
@@ -455,7 +603,11 @@ class QRDetector(Node):
 
     def safe_zone_callback(self, message):
         """Step 5: /safe_zone=True sends the Municipality packet ONLY if the
-        QR was verified.  Transition QR_VERIFIED -> SEND_PACKET."""
+        QR was verified.  Transition QR_VERIFIED -> SEND_PACKET.
+
+        File 1 protocol: final hospital (goal Z) sends "PARKED" once
+        instead of the goal letter. All other missions send A/B/C/X/Y.
+        """
         self._log_ros_topic("/safe_zone", message.data if message else None)
 
         self.get_logger().info(
@@ -465,6 +617,8 @@ class QRDetector(Node):
             f"FSM: {self.fsm_state} Comm: {self.comm_state}\n"
             f"Expected QR: {self.expected_qr} Verified QR: {self.verified_qr}\n"
             f"qr_verified={self.qr_verified}\n"
+            f"Goal: {self.current_goal} final={self._is_final_mission()} "
+            f"parked_sent={self.parked_sent}\n"
             f"==========================================\n"
         )
 
@@ -475,8 +629,9 @@ class QRDetector(Node):
             )
             return
 
-        # Only send the Municipality packet if the QR was verified.
-        if not self.qr_verified or self.verified_qr != self.expected_qr:
+        if self.bonus_active:
+            pass  # bonus park /safe_zone does not need a QR
+        elif not self.qr_verified or self.verified_qr != self.expected_qr:
             self.get_logger().info(
                 "EXIT CALLBACK: safe_zone_callback\n"
                 "REASON: Safe zone ignored because QR has not been verified.\n"
@@ -504,10 +659,19 @@ class QRDetector(Node):
             f"--------------------------------\n"
         )
 
-        # Send the Municipality packet using the existing protocol.
+        # Bonus park finished: start / keep PARKED every 4 s.
+        if self.bonus_active:
+            if self.comm_state != COMM_WAITING_ACK:
+                self.send_mission_to_server("PARKED")
+                self._last_parked_send = time.time()
+            self.get_logger().info(
+                "EXIT CALLBACK: safe_zone_callback | BONUS park "
+                "— PARKED loop running")
+            return
+
+        # Normal legs (including Z) still send the goal letter.
         self.send_mission_to_server(self.current_goal)
 
-        # Transition to SEND_PACKET.
         prev_fsm = self.fsm_state
         self.fsm_state = FSM_SEND_PACKET
         self.get_logger().info(
@@ -534,7 +698,6 @@ class QRDetector(Node):
             f"==========================================\n"
         )
 
-        # Official PATIENT_x / HOSPITAL_x payloads.
         extracted_hospital = self._extract_hospital_name(payload_upper)
         extracted_patient = self._extract_patient_name(payload_upper)
 
@@ -548,7 +711,6 @@ class QRDetector(Node):
             self._log_counters(f"After Patient Assignment {extracted_patient}")
             return
 
-        # Legacy A/B/C/X/Y/Z, OK, INVALID.
         if payload_upper not in VALID_MISSION_PAYLOADS:
             self.get_logger().warn(
                 f"Unknown payload \"{raw_payload}\" - ignoring"
@@ -566,7 +728,12 @@ class QRDetector(Node):
             return
 
         if payload_upper == "INVALID":
-            # Keep the current mission; keep searching for the correct QR.
+            if self.bonus_active and not self.bonus_ok:
+                self.get_logger().info(
+                    "BONUS: server INVALID — keep sending PARKED every 4 s")
+                self.comm_state = COMM_IDLE
+                self.pending_outgoing_msg = None
+                return
             self.get_logger().info(
                 f"Received INVALID from server - keeping current mission "
                 f"(goal {self.current_goal}). Continuing search."
@@ -579,13 +746,18 @@ class QRDetector(Node):
             self.get_logger().info(
                 f"MISSION FINISHED - Received OK -> {MISSION_COMPLETE}"
             )
+            if self.bonus_active:
+                self.bonus_ok = True
+                self.bonus_active = False
+                self.get_logger().info(
+                    "BONUS: server OK — stop PARKED loop")
             self.mission_state = MISSION_COMPLETE
             self._publish_resume_line_following("MISSION_COMPLETE")
-            # Clear verification, wait for the next assignment.
             self.qr_verified = False
             self.verified_qr = None
             self.expected_qr = None
             self.expected_target_type = None
+            self._reset_verified_visibility()
             self.fsm_state = FSM_SEARCHING_QR
             self._log_counters("After OK")
             return
@@ -764,7 +936,6 @@ class QRDetector(Node):
                 self.comm_state = COMM_FAILED
                 self.ack_failed += 1
 
-                # Recover the communication layer only; keep the mission intact.
                 self.pending_outgoing_msg = None
                 self.pending_send_time = None
                 self.retry_count = 0
@@ -848,24 +1019,34 @@ class QRDetector(Node):
                         f"Comm {prev} -> {self.comm_state} ACK ONLY confirms reception"
                     )
 
-                    # ---- Step 6: ACK success ----
-                    # Resume the line follower, clear verification, wait for the
-                    # next Municipality assignment.
-                    if self.fsm_state == FSM_SEND_PACKET:
+                    pending_payload = str(
+                        getattr(self.pending_outgoing_msg,
+                                SERVER_FIELD_MSG, "") or "").strip().upper()
+                    if pending_payload == "PARKED":
+                        # Bonus PARKED ACK: do not resume; keep looping.
+                        self.comm_state = COMM_IDLE
+                        self.pending_outgoing_msg = None
+                        self.get_logger().info(
+                            "BONUS: PARKED ACK — will send again in 4 s "
+                            "until server OK (INVALID keeps going)")
+                    elif self.fsm_state == FSM_SEND_PACKET:
+                        self._note_leg_complete(
+                            pending_payload or self.current_goal)
                         self.get_logger().info(
                             f"\n--------------------------------\n"
                             f"SAFE ZONE MISSION SUCCESS\n"
                             f"ACK Received - Publishing /resume_line_following\n"
                             f"Timestamp: {self._get_timestamp_str()}\n"
+                            f"Legs: {self.mission_leg_count}/6\n"
                             f"--------------------------------\n"
                         )
-                        self._publish_resume_line_following("RESUME")
-                        # Clear verification; the next assignment re-arms the
-                        # expected target and we resume scanning immediately.
+                        if not self.bonus_active:
+                            self._publish_resume_line_following("RESUME")
                         self.qr_verified = False
                         self.verified_qr = None
                         self.expected_qr = None
                         self.expected_target_type = None
+                        self._reset_verified_visibility()
                         prev_fsm = self.fsm_state
                         self.fsm_state = FSM_SEARCHING_QR
                         self.get_logger().info(
@@ -912,7 +1093,6 @@ class QRDetector(Node):
                 self.duplicate_acks += 1
                 return
 
-        # Duplicate detection for server mission packets (new assignment).
         if self.last_processed_server_uid is not None and uid == self.last_processed_server_uid:
             self.get_logger().warn(
                 f"FAILURE: Duplicate packet ignored. Duplicate mission packet "
@@ -932,7 +1112,7 @@ class QRDetector(Node):
         self.get_logger().info("EXIT CALLBACK: server_communication_callback")
 
     # ==================================================================
-    # Publish helpers (topic names unchanged)
+    # Publish helpers (topic names unchanged — file 2)
     # ==================================================================
     def _publish_target_type(self, target_type):
         ts = self._get_timestamp_str()
@@ -1009,28 +1189,10 @@ class QRDetector(Node):
         self.get_logger().info(f"Published /mission/available: {target_qr}")
 
     # ==================================================================
-    # Camera / QR vision pipeline  ** SIMPLIFIED **
+    # Camera / QR vision pipeline
     # ==================================================================
-    #
-    # Detection strategy (UNCHANGED):
-    #   1. Build a small set of grayscale variants, shared by both detectors.
-    #   2. Try pyzbar on every variant (robust to rotation/noise).
-    #   3. Fall back to cv2.QRCodeDetector on the same variants.
-    #   4. Stop at the first successful decode; only one payload is returned.
-    #
-    # What was simplified:
-    #   - The old 9-variant grid (original, gray, hist-eq, blur, adaptive
-    #     threshold, Otsu, CLAHE, 2x, 3x) is now 3 variants. Both detectors
-    #     binarize internally, so the dedicated threshold/equalization variants
-    #     were redundant; CLAHE covers the low-contrast case and one 2x
-    #     upscale covers small/distant codes (3x was marginal and expensive).
-    #   - Coordinate scale-back is now a single scalar (all variants keep the
-    #     aspect ratio), so corner points are scaled in one in-place op.
-    #   - Verbose per-variant try/except/debug scaffolding was collapsed.
-    # ==================================================================
-
     def camera_image_callback(self, message):
-        """Decode frame -> detect QR -> overlay -> validate -> visualize."""
+        """Decode frame -> detect QR -> overlay -> validate -> visibility."""
         try:
             np_arr = np.frombuffer(message.data, np.uint8)
             image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
@@ -1049,6 +1211,8 @@ class QRDetector(Node):
         if qr_data:
             self.handle_qr_detection(qr_data)
 
+        self._update_verified_qr_visibility(qr_data)
+
         try:
             cv2.imshow("QR Detector", image)
             if cv2.waitKey(1) & 0xFF == ord('q'):
@@ -1057,17 +1221,6 @@ class QRDetector(Node):
             self.get_logger().debug(f"OpenCV visualization failed: {e}")
 
     def image_variants(self, image):
-        """
-        Build the three grayscale variants used for detection:
-
-            1. plain grayscale      - the normal case,
-            2. CLAHE contrast boost - low-contrast / unevenly lit frames,
-            3. 2x upscale           - small or distant QR codes.
-
-        Returns a list of (variant_image, scale) where `scale` multiplies
-        corner coordinates found in that variant back into original-image
-        space (e.g. 0.5 for the 2x-upscaled variant).
-        """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
         variants = [(gray, 1.0)]
@@ -1079,16 +1232,6 @@ class QRDetector(Node):
         return variants
 
     def detect_qr_code(self, image):
-        """
-        Main QR detection entry point.
-
-        Try pyzbar first, then cv2.QRCodeDetector, on the same shared
-        variants. Stop at the first successful decode.
-
-        Returns:
-            (data, points) - decoded string and (N, 2) corner array in
-            ORIGINAL image coordinates, or (None, None) if no QR found.
-        """
         variants = self.image_variants(image)
 
         for detector in (self.detect_with_pyzbar, self.detect_with_opencv):
@@ -1099,11 +1242,6 @@ class QRDetector(Node):
         return None, None
 
     def detect_with_pyzbar(self, variants):
-        """
-        Try pyzbar on each variant; stop and return on the first decode.
-
-        Returns (data, points) in ORIGINAL image space, or (None, None).
-        """
         if not PYZBAR_AVAILABLE:
             return None, None
 
@@ -1121,7 +1259,6 @@ class QRDetector(Node):
                 if not data:
                     continue
 
-                # Prefer the polygon (follows rotation); else use the rect.
                 if obj.polygon and len(obj.polygon) >= 4:
                     points = np.array([[p.x, p.y] for p in obj.polygon],
                                       dtype=np.float32)
@@ -1131,17 +1268,12 @@ class QRDetector(Node):
                         [[x, y], [x + w, y], [x + w, y + h], [x, y + h]],
                         dtype=np.float32)
 
-                points *= scale  # back to original image space
+                points *= scale
                 return data, points
 
         return None, None
 
     def detect_with_opencv(self, variants):
-        """
-        Fallback: try cv2.QRCodeDetector on each variant; stop on first
-        decode. Returns (data, points) in ORIGINAL image space, or
-        (None, None).
-        """
         for img, scale in variants:
             try:
                 data, bbox, _ = self.qr_detector.detectAndDecode(img)
@@ -1152,13 +1284,12 @@ class QRDetector(Node):
                 continue
 
             points = bbox.reshape(-1, 2).astype(np.float32)
-            points *= scale  # back to original image space
+            points *= scale
             return data.strip(), points
 
         return None, None
 
     def draw_qr_overlay(self, image, bbox, qr_data):
-        """Draw the QR bounding box and decoded text onto the frame."""
         try:
             pts = bbox.reshape(-1, 2).astype(int)
             for i in range(len(pts)):
@@ -1172,11 +1303,7 @@ class QRDetector(Node):
         except Exception:
             pass
 
-    # ------------------------------------------------------------------
-    # Clean shutdown
-    # ------------------------------------------------------------------
     def destroy_node(self):
-        """Ensures OpenCV windows are destroyed on node shutdown."""
         self.get_logger().info("ENTER: destroy_node")
         try:
             cv2.destroyAllWindows()
@@ -1200,3 +1327,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
