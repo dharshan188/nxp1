@@ -275,40 +275,19 @@ def select_arrow_component(mask):
         if bw < 3 or bh < 3:
             continue
         near_edge = (x <= 2) or (x + bw >= w - 2)
-        # Reject small edge specks/fragments that expand the bbox and ruin
-        # STRAIGHT detection, especially in Z.
+        # Reject tiny edge specks/fragments.
         if near_edge and area < 45:
             continue
-        # Reject vertical divider fragments. Dividers are narrow and almost
-        # full ROI height. A true STRAIGHT shaft is narrow too, but it is not
-        # full height and is usually connected to the arrow head.
         if bw <= 10 and bh > 0.72 * h:
             continue
         if near_edge and bw <= 8 and bh > 0.30 * h:
             continue
-        # Reject thin horizontal divider/border stripes: they span most of the
-        # ROI width but are very short. These are letter/arrow separator lines
-        # caught at far or tilted range (else classified as a false horizontal
-        # arrow). A real horizontal arrow has a tall triangular head, so it is
-        # never a thin full-width band.
         if bw >= 0.80 * w and bh <= 0.30 * h:
             continue
-        # Reject full-height vertical fragments (letter strokes / borders that
-        # bleed into the ROI at tilted or far range). A real arrow never spans
-        # the entire ROI height (top AND bottom edges). Width-bounded so genuine
-        # straight-arrow heads (wider, with margin) are not affected.
         if y <= 1 and (y + bh) >= (h - 1) and bw <= 14:
             continue
-        # Reject sparse "frame" noise that spans the whole ROI (touches all four
-        # edges) from heavy JPEG/tilt. Dense floods are caught later by the fill
-        # guard; this catches low-area full-span noise. A real arrow never
-        # touches all four ROI edges at once.
         if x <= 1 and (x + bw) >= (w - 1) and y <= 1 and (y + bh) >= (h - 1):
             continue
-        # Reject high fragments; after the lower crop, real arrow pixels are
-        # still in the middle/lower part of the ROI. This prevents letter
-        # pieces, especially the vertical part of 'A', from being classified
-        # as a STRAIGHT arrow at mid range.
         if cy < 0.18 * h:
             continue
         selected[labels == cid] = 255
@@ -324,7 +303,6 @@ def select_arrow_component(mask):
         kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         selected = cv2.morphologyEx(selected, cv2.MORPH_CLOSE, kernel, iterations=1)
         return selected
-    # Fallback: keep best component if everything was filtered too hard.
     if best_id is not None:
         selected[labels == best_id] = 255
         return selected
@@ -343,9 +321,6 @@ def classify_arrow_mask(mask):
         return None, 0.0
     aspect = bw / float(bh + 1e-6)
     pixels = int(xs.size)
-    # Quality gate: a reliable arrow has enough mass. Tiny/degraded blobs (far
-    # range, blur) score high confidence but are wrong -> reject ("in doubt,
-    # leave it") so a direction is only emitted when the arrow is substantial.
     if pixels < ARROW_MIN_PIXELS:
         return None, 0.0
     sub = (mask[y0:y1 + 1, x0:x1 + 1] > 0).astype(np.uint8)
@@ -354,19 +329,9 @@ def classify_arrow_mask(mask):
     max_col_fill = float(col_counts.max()) / float(max(bh, 1))
     max_row_fill = float(row_counts.max()) / float(max(bw, 1))
 
-    # Reject disconnected fragments unioned into a false shape. If a large
-    # fraction of columns in the bbox are empty, the selected mask is really
-    # two or more separated blobs (letter pieces / partial arrow bits caught at
-    # far or tilted range), not one connected arrow.
     if bw > 0 and int(np.count_nonzero(col_counts)) < 0.55 * bw:
         return None, 0.0
 
-    # ------------------------------------------------------------------
-    # STRAIGHT / UP detector.
-    # A straight arrow has a central vertical shaft + head. The important
-    # signature is a tall vertical column. This is checked BEFORE left/right
-    # so B/Z do not become LEFT/RIGHT when head/shaft split or blur.
-    # ------------------------------------------------------------------
     vertical_like = (
         pixels >= 35 and
         bh >= 14 and
@@ -379,7 +344,6 @@ def classify_arrow_mask(mask):
         aspect <= 1.10
     )
     if vertical_like or very_vertical:
-        # confidence from vertical strength and narrowness
         aspect_conf = np.clip((1.35 - aspect) / max(1.35 - 0.55, 1e-6), 0.0, 1.0)
         col_conf = np.clip(max_col_fill / 0.75, 0.0, 1.0)
         conf = max(0.82, min(1.0, 0.55 * aspect_conf + 0.45 * col_conf))
@@ -387,8 +351,6 @@ def classify_arrow_mask(mask):
             return None, 0.0
         return "STRAIGHT", float(conf)
 
-    # LEFT/RIGHT requires a clearly horizontal arrow. If it is not clearly
-    # vertical and not clearly horizontal, skip instead of guessing.
     horizontal_like = (
         aspect >= HORIZONTAL_ASPECT_MIN and
         max_row_fill >= 0.35 and
@@ -396,7 +358,6 @@ def classify_arrow_mask(mask):
     )
     if not horizontal_like:
         return None, 0.0
-    # Centroid relative to bbox center is stable for left/right on this board.
     bbox_center_x = 0.5 * (x0 + x1)
     centroid_x = float(xs.mean())
     centroid_offset = (centroid_x - bbox_center_x) / float(max(bw, 1))
@@ -419,8 +380,8 @@ def read_arrow_direction(cell, debug=False):
     best = (None, 0.0)
     best_artifacts = None
     for y0_ratio, y1_ratio in (
-        (ARROW_UPPER_Y0, ARROW_UPPER_Y1),   # upper-middle layout
-        (ARROW_Y0_RATIO, ARROW_Y1_RATIO),   # lower layout
+        (ARROW_UPPER_Y0, ARROW_UPPER_Y1),
+        (ARROW_Y0_RATIO, ARROW_Y1_RATIO),
     ):
         mask, roi, offset = arrow_mask_from_cell(cell, y0_ratio, y1_ratio)
         if mask is None:
@@ -428,7 +389,6 @@ def read_arrow_direction(cell, debug=False):
         arrow = select_arrow_component(mask)
         if arrow is None:
             continue
-        # Flood-guard: one arrow cannot fill most of the ROI -> contaminated.
         if arrow.size and (arrow.sum() / 255.0) / arrow.size > ARROW_FILL_MAX:
             continue
         direction, confidence = classify_arrow_mask(arrow)
@@ -474,11 +434,7 @@ def read_boards(frame):
 
 
 def read_board(frame):
-    """
-    Compatibility helper.
-    Returns {letter: (direction, confidence)} using the highest confidence
-    across all visible boards.
-    """
+    """Compatibility helper using the highest confidence across all boards."""
     board_reads = read_boards(frame)
     results = {}
     for board in board_reads:
@@ -523,18 +479,7 @@ def select_target_board(board_reads, frame_shape):
 # ROS2 NODE - SIMPLIFIED COMMUNICATION: NO MUNICIPALITY SERVER
 # ============================================================================
 class ObjectRecognizer(Node):
-    """
-    ROS2 node:
-      - subscribes camera image
-      - subscribes /mission/available for immediate goal updates (Purpose 1:
-        Municipality -> QR Detector -> Object Recognizer).  The goal updates
-        at assignment time, before the QR is verified.  It does NOT depend on
-        /target_qr (that topic is the QR Detector -> Line Follower path,
-        Purpose 2, published only after QR match).
-      - processes every detected board
-      - publishes locked turn direction on /mission/turn
-      - after the board disappears, resets and searches again for current goal
-    """
+    """ROS2 object/sign recognizer node."""
 
     def __init__(self):
         super().__init__('object_recognizer')
@@ -555,17 +500,8 @@ class ObjectRecognizer(Node):
         self.mission_locked = False
         self.current_mission = None
         self.missing_frames = 0
-
-        # Temporal vote window for the current approach. A sliding window (not a
-        # running total) so early far-range wrong reads fall off and the
-        # close-range correct read can win; a lock needs a full window + a
-        # clear supermajority.
         self.vote_window = deque(maxlen=VOTE_WINDOW)
 
-        # Mission target cache (replaces Municipality Server).
-        # latest_target_qr holds the CANONICAL target (from /mission/available)
-        # of the CURRENT mission.  Initialized to None so the first real
-        # mission is never mistaken for a duplicate.
         self.latest_target_type = "PATIENT"
         self.latest_target_qr = None
 
@@ -575,13 +511,6 @@ class ObjectRecognizer(Node):
             self.camera_image_callback,
             10)
 
-        # Purpose 1 (Municipality -> QR Detector -> Object Recognizer):
-        # every new mission is received immediately after Municipality
-        # assignment via /mission/available.  The QR Detector publishes this
-        # topic at assignment time with the target QR payload (e.g. PATIENT_2).
-        # The detector does NOT depend on /target_qr for goal updates -
-        # /target_qr (Purpose 2) is only published after the QR is verified and
-        # is consumed by the Line Follower, not by this node.
         self.subscription_mission_available = self.create_subscription(
             String,
             '/mission/available',
@@ -598,12 +527,7 @@ class ObjectRecognizer(Node):
             f"Listening to /mission/available for immediate mission updates (Municipality Server removed).")
 
     def _reset_detection_state(self):
-        """Full detector-state reset for a brand-new mission.
-
-        Clears every counter/streak/lock/cached value that belongs to the
-        previous mission so the detector can never continue searching for an
-        old goal.
-        """
+        """Full detector-state reset for a brand-new mission."""
         self.current_mission = None
         self.missing_frames = 0
         self.mission_locked = False
@@ -632,37 +556,13 @@ class ObjectRecognizer(Node):
         self.get_logger().info(
             f"Board exited. Continuing with current goal '{current_goal}'. Waiting for next board or /mission/available update.")
 
-    # ------------------------------------------------------------------
-    # PURPOSE-1 COMMUNICATION: Municipality -> QR Detector -> Object Recognizer
-    # ------------------------------------------------------------------
     def mission_available_callback(self, msg):
-        """
-        Receive every new mission from the QR Detector immediately after a
-        Municipality assignment, via /mission/available.
-
-        This is the ONLY goal-update path for the Object Recognizer.  It runs
-        at ASSIGNMENT time, BEFORE the QR is verified, so the detector always
-        searches for the newest goal without waiting for QR verification and
-        without a node restart.
-
-        The detector does NOT depend on /target_qr for goal updates.  /target_qr
-        (Purpose 2: QR Detector -> Line Follower) is published only after the
-        QR has actually been matched and is consumed by the Line Follower.
-
-        Mapping (kept exactly):
-            PATIENT_1->A, PATIENT_2->B, PATIENT_3->C,
-            HOSPITAL_1->X, HOSPITAL_2->Y, HOSPITAL_3->Z
-
-        A duplicate mission (same target as the current one) is ignored -
-        no reset, no stale goal.
-        """
+        """Receive and map every new mission from /mission/available."""
         if msg is None or not msg.data:
             return
 
         raw_qr = msg.data.strip()
         qr_upper = raw_qr.strip().upper()
-
-        # Normalize: extract PATIENT_* or HOSPITAL_* if wrapped in {LOC: ...} or similar
         normalized_qr = qr_upper
         for known in TARGET_QR_TO_GOAL.keys():
             if known in qr_upper:
@@ -676,8 +576,6 @@ class ObjectRecognizer(Node):
             return
 
         mapped_goal = TARGET_QR_TO_GOAL[normalized_qr]
-
-        # Infer target type for logging.
         if "PATIENT" in normalized_qr:
             target_type = "PATIENT"
         elif "HOSPITAL" in normalized_qr:
@@ -685,8 +583,6 @@ class ObjectRecognizer(Node):
         else:
             target_type = self.latest_target_type
 
-        # Duplicate handling.  Identical target to the current mission -> do
-        # nothing, do NOT reset, do NOT clear counters.  Only log.
         if self.latest_target_qr is not None and self.latest_target_qr == normalized_qr:
             self.get_logger().info(
                 "Duplicate mission ignored.\n"
@@ -697,23 +593,14 @@ class ObjectRecognizer(Node):
             )
             return
 
-        # NEW MISSION: keep the old goal only for logging, then fully reset.
         old_goal = self.goal_letter
-
-        # Discard the previous mission completely.
-        self._reset_detection_state()   # clears current_mission, missing_frames,
-                                        # mission_locked, goal_valid, vote tally
-
-        # Assign the new mapped goal.
+        self._reset_detection_state()
         self.goal_letter = mapped_goal
         self.goal_valid = True
         self._last_param_goal = mapped_goal
-
-        # Synchronize every cached mission variable to the new mission.
         self.latest_target_qr = normalized_qr
         self.latest_target_type = target_type
 
-        # Synchronize the ROS parameter that stores the goal.
         try:
             self.set_parameters([
                 Parameter('goal_letter', Parameter.Type.STRING, mapped_goal)
@@ -721,7 +608,6 @@ class ObjectRecognizer(Node):
         except Exception:
             pass
 
-        # Detailed log per required format.
         self.get_logger().info(
             "\n========================================\n"
             "NEW MISSION RECEIVED (from /mission/available)\n"
@@ -749,11 +635,7 @@ class ObjectRecognizer(Node):
                 f"Goal {mapped_goal} reconfirmed from {raw_qr}. Detector reset for fresh search.")
 
     def _check_parameter_goal(self):
-        """
-        Parameter support is kept, but it only reacts to actual parameter
-        changes. The current goal persists after board exit unless
-        /mission/available or parameter explicitly changes it.
-        """
+        """React only to actual manual goal parameter changes."""
         param_goal = self.get_parameter('goal_letter').get_parameter_value().string_value.upper()
         if param_goal not in LETTER_ORDER:
             return
@@ -780,10 +662,8 @@ class ObjectRecognizer(Node):
         if image is None:
             return
 
-        # Still allow manual parameter goal changes.
         self._check_parameter_goal()
 
-        # Mission is locked: do not publish again. Only wait for board exit.
         if self.mission_locked:
             self._handle_locked_wait_for_exit(image)
             return
@@ -802,15 +682,11 @@ class ObjectRecognizer(Node):
         board_reads = read_boards(image)
 
         if not board_reads:
-            # Board gone -> start a fresh vote window for the next board.
             if self.vote_window:
                 self.vote_window.clear()
             self.get_logger().info("No mid-range board detected.", throttle_duration_sec=2.0)
             return
 
-        # Multi-board detection is still enabled, but mission decision uses only
-        # the forward/center board. This avoids a side board with high confidence
-        # changing the mission.
         target_board = select_target_board(board_reads, image.shape)
 
         best = None
@@ -831,8 +707,6 @@ class ObjectRecognizer(Node):
                     }
 
         if best is None:
-            # No reliable read this frame (quality gate rejected it, or goal
-            # cell not found). Do NOT reset the window - just skip voting.
             self.get_logger().info(
                 f"Goal '{self.goal_letter}' not read this frame. window={dict(self._window_tally())}",
                 throttle_duration_sec=1.0)
@@ -843,9 +717,6 @@ class ObjectRecognizer(Node):
         board_w = best["board_w"]
         board_h = best["board_h"]
 
-        # Closeness gate: do NOT vote until the board is close enough to read
-        # reliably. Far / mid-range reads are degraded and wrong; voting on them
-        # is what causes the oscillation and premature (transitional) locks.
         min_lock_w = self.get_parameter('min_lock_board_width').get_parameter_value().integer_value
         if board_w < min_lock_w:
             self.get_logger().info(
@@ -860,9 +731,6 @@ class ObjectRecognizer(Node):
                 throttle_duration_sec=1.0)
             return
 
-        # ---- VOTE: push into a SLIDING WINDOW of recent reads ----
-        # A sliding window (not a running total) so early far-range wrong reads
-        # fall off and the close-range correct read can reach a supermajority.
         self.vote_window.append(direction)
         counts = self._window_tally()
         top_dir = max(counts, key=counts.get)
@@ -875,9 +743,6 @@ class ObjectRecognizer(Node):
             f"board={board_w}x{board_h}  boards_seen={boards_seen}  "
             f"| window={dict(counts)}  top={top_dir}={top_n}/{win_n}")
 
-        # ---- LOCK: only on a FULL window with a clear supermajority ----
-        # Full-window requirement prevents locking on a short early wrong run;
-        # the supermajority prevents locking on genuine oscillation.
         if (win_n >= VOTE_WINDOW and
                 top_n >= required_votes and
                 top_n >= VOTE_SUPERMAJORITY * win_n):
