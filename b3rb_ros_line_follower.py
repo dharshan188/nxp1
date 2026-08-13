@@ -35,6 +35,17 @@ class StraightGuidanceMode:
     OBSTACLE_AVOID = "STRAIGHT_GREEN_OBSTACLE_AVOID"
 
 
+# LEFT/RIGHT intersection turn. Isolated from STRAIGHT/parking.
+# SEARCH: keep rolling and yaw toward the mission side until the inner
+# edge reappears (classic AGV "arc until the line is reacquired").
+# FOLLOW: track that inner edge at a standoff — never touch it.
+class TurnMode:
+    INACTIVE = "TURN_INACTIVE"
+    DECIDE = "TURN_DECIDE"  # unused; kept so old logs/params do not break
+    SEARCH = "TURN_SEARCH"
+    FOLLOW = "TURN_FOLLOW"
+
+
 class LineFollower(Node):
     def __init__(self):
         super().__init__('line_follower')
@@ -122,6 +133,38 @@ class LineFollower(Node):
         self.declare_parameter('green_obstacle_min_side_clearance', 1.00)
         self.declare_parameter('green_obstacle_require_two_vectors', True)
 
+        # LEFT/RIGHT intersection turn. Mirrors STRAIGHT: stop, decide the
+        # committed side, then go. The inner edge is a hard standoff so a
+        # left turn never touches the left lane (real-driving clearance).
+        self.declare_parameter('turn_enable', True)
+        self.declare_parameter('turn_decide_time', 0.0)
+        self.declare_parameter('turn_stop_on_unsafe', False)
+        self.declare_parameter('turn_search_steer', 0.40)
+        self.declare_parameter('turn_search_steer_min', 0.18)
+        self.declare_parameter('turn_search_increase_frac', 0.10)
+        self.declare_parameter('turn_search_increase_dt', 0.25)
+        self.declare_parameter('turn_search_ramp_time', 2.4)
+        self.declare_parameter('turn_search_speed', 0.38)
+        self.declare_parameter('turn_search_bias_frac', 0.08)
+        self.declare_parameter('turn_follow_offset_frac', 0.38)
+        self.declare_parameter('turn_inner_margin_ratio', 0.15)
+        self.declare_parameter('turn_inner_margin_px', 36.0)
+        self.declare_parameter('turn_follow_speed', 0.40)
+        self.declare_parameter('turn_see_band_frac', 0.28)
+        self.declare_parameter('turn_follow_heading_gain', 0.42)
+        self.declare_parameter('turn_follow_heading_max', 0.28)
+        self.declare_parameter('turn_entry_width_ratio', 1.50)
+        self.declare_parameter('turn_entry_spike_ratio', 1.35)
+        self.declare_parameter('turn_lost_confirm_frames', 2)
+        self.declare_parameter('turn_follow_confirm_frames', 2)
+        self.declare_parameter('turn_exit_stable_frames', 8)
+        self.declare_parameter('turn_exit_width_ratio', 1.30)
+        self.declare_parameter('turn_exit_heading_deg', 15.0)
+        self.declare_parameter('turn_min_time', 0.90)
+        self.declare_parameter('turn_max_time', 12.0)
+        self.declare_parameter('turn_cooldown_after_timeout', 1.20)
+        self.declare_parameter('turn_approach_bias_frac', 0.04)
+
         # Safe-zone beam-density detector
         self.declare_parameter('zone_close_min_dist', 0.65)
         self.declare_parameter('zone_close_max_dist', 1.00)
@@ -158,6 +201,16 @@ class LineFollower(Node):
         self.declare_parameter('target_type_wait_timeout', 0.5)
 
         self._reload_params()
+        if not hasattr(self, 'turn_search_increase_frac'):
+            self.turn_search_increase_frac = 0.10
+        if not hasattr(self, 'turn_search_increase_dt'):
+            self.turn_search_increase_dt = 0.25
+        if not hasattr(self, '_turn_search_cmd'):
+            self._turn_search_cmd = 0.0
+        if not hasattr(self, '_turn_search_bump_time'):
+            self._turn_search_bump_time = None
+        if not hasattr(self, '_turn_both_count'):
+            self._turn_both_count = 0
 
         # Line controller runtime
         self.error = 0.0
@@ -245,6 +298,29 @@ class LineFollower(Node):
         self._obstacle_left_min = float('inf')
         self._obstacle_right_min = float('inf')
         self._obstacle_scan_time = None
+
+        # LEFT/RIGHT turn runtime
+        self._turn_mode = TurnMode.INACTIVE
+        self._turn_side = None
+        self._turn_entry_time = None
+        self._turn_search_start_time = None
+        self._turn_search_cmd = 0.0
+        self._turn_search_bump_time = None
+        self._turn_stable_count = 0
+        self._turn_lost_count = 0
+        self._turn_seen_count = 0
+        self._turn_target_visible = False
+        self._turn_target_x = None
+        self._turn_outer_x = None
+        self._turn_img_center = 0.0
+        self._turn_completed = False
+        self._turn_cooldown_until = 0.0
+        self._turn_debug_log_time = 0.0
+        self._turn_last_reason = ""
+        self._turn_no_safe_path = False
+        self._turn_lane_safe = True
+        self._turn_inner_clear_px = None
+        self._turn_decided = True
 
         # Mission FSM
         self.mission_state = MissionState.NORMAL_LINE_FOLLOWING
@@ -353,7 +429,9 @@ class LineFollower(Node):
         self.get_logger().info(
             "Lane-following controller loaded.\n"
             f"Mission FSM initial state: {self.mission_state}\n"
-            f"STRAIGHT green-board topic: {self.green_board_topic}")
+            f"STRAIGHT green-board topic: {self.green_board_topic}\n"
+            "LEFT/RIGHT: if inner vector missing, increase that "
+            "turn by a percentage; if visible, follow at a standoff.")
 
     def _transition_mission_state(self, new_state, reason=""):
         old = self.mission_state
@@ -535,6 +613,66 @@ class LineFollower(Node):
             0.05, float(g('green_obstacle_min_side_clearance')))
         self.green_obstacle_require_two_vectors = bool(
             g('green_obstacle_require_two_vectors'))
+
+        # LEFT/RIGHT turn parameters.
+        self.turn_enable = bool(g('turn_enable'))
+        self.turn_decide_time = max(0.0, float(g('turn_decide_time')))
+        self.turn_stop_on_unsafe = bool(g('turn_stop_on_unsafe'))
+        self.turn_search_steer = max(
+            0.20, min(0.85, float(g('turn_search_steer'))))
+        self.turn_search_steer_min = max(
+            0.10, min(self.turn_search_steer, float(
+                g('turn_search_steer_min'))))
+        try:
+            self.turn_search_increase_frac = max(
+                0.02, min(0.25, float(g('turn_search_increase_frac'))))
+        except Exception:
+            self.turn_search_increase_frac = 0.10
+        try:
+            self.turn_search_increase_dt = max(
+                0.10, float(g('turn_search_increase_dt')))
+        except Exception:
+            self.turn_search_increase_dt = 0.25
+        self.turn_search_ramp_time = max(
+            0.4, float(g('turn_search_ramp_time')))
+        self.turn_search_speed = max(
+            SPEED_MIN, min(SPEED_MAX, float(g('turn_search_speed'))))
+        self.turn_search_bias_frac = max(
+            0.0, min(0.25, float(g('turn_search_bias_frac'))))
+        self.turn_follow_offset_frac = max(
+            0.28, min(0.46, float(g('turn_follow_offset_frac'))))
+        self.turn_inner_margin_ratio = max(
+            0.08, min(0.22, float(g('turn_inner_margin_ratio'))))
+        self.turn_inner_margin_px = max(
+            24.0, float(g('turn_inner_margin_px')))
+        self.turn_see_band_frac = max(
+            0.10, min(0.45, float(g('turn_see_band_frac'))))
+        self.turn_follow_speed = max(
+            SPEED_MIN, min(SPEED_MAX, float(g('turn_follow_speed'))))
+        self.turn_follow_heading_gain = max(
+            0.0, float(g('turn_follow_heading_gain')))
+        self.turn_follow_heading_max = max(
+            0.0, min(1.0, float(g('turn_follow_heading_max'))))
+        self.turn_entry_width_ratio = max(
+            1.05, float(g('turn_entry_width_ratio')))
+        self.turn_entry_spike_ratio = max(
+            1.05, float(g('turn_entry_spike_ratio')))
+        self.turn_lost_confirm_frames = max(
+            1, int(g('turn_lost_confirm_frames')))
+        self.turn_follow_confirm_frames = max(
+            1, int(g('turn_follow_confirm_frames')))
+        self.turn_exit_stable_frames = max(
+            2, int(g('turn_exit_stable_frames')))
+        self.turn_exit_width_ratio = max(
+            1.05, float(g('turn_exit_width_ratio')))
+        self.turn_exit_heading_deg = max(
+            4.0, float(g('turn_exit_heading_deg')))
+        self.turn_min_time = max(0.0, float(g('turn_min_time')))
+        self.turn_max_time = max(1.0, float(g('turn_max_time')))
+        self.turn_cooldown_after_timeout = max(
+            0.0, float(g('turn_cooldown_after_timeout')))
+        self.turn_approach_bias_frac = max(
+            0.0, min(0.15, float(g('turn_approach_bias_frac'))))
 
         # The topic parameter is live-reloadable too. Recreate only this
         # subscription; no existing topic or callback is touched.
@@ -799,6 +937,7 @@ class LineFollower(Node):
             self.current_mission = mission
             self._straight_junction_side = None
             self._reset_intersection_state()
+            self._reset_turn_state(clear_completed=True)
             self._heading_ema_init = False
             return
         if self.mission_state == MissionState.WAITING_FOR_SAFE_ZONE:
@@ -808,6 +947,7 @@ class LineFollower(Node):
                 self.current_mission = mission
                 self._straight_junction_side = None
                 self._reset_intersection_state()
+                self._reset_turn_state(clear_completed=True)
                 self._heading_ema_init = False
             self.last_valid_mission = mission
             return
@@ -816,6 +956,7 @@ class LineFollower(Node):
             self.current_mission = mission
             self._straight_junction_side = None
             self._reset_intersection_state()
+            self._reset_turn_state(clear_completed=True)
             self._heading_ema_init = False
         self.last_valid_mission = mission
 
@@ -951,7 +1092,7 @@ class LineFollower(Node):
 
         A brief LOST uses the exact last accepted target. After hold_time the
         contribution fades to zero, and at lost_timeout the existing STRAIGHT
-        intersection controller is used alone. No direction is invented.
+        intersection controller is used alone. No direction is inventeded alone. No direction is invented.
         """
         if (self._green_last_valid_direction is None or
                 self._green_last_valid_time is None):
@@ -1401,6 +1542,565 @@ class LineFollower(Node):
             f"Lane safe   : {'YES' if self._green_last_lane_safe else 'NO'}\n"
             f"State       : {self._green_guidance_mode}")
 
+    # ==================================================================
+    # LEFT / RIGHT intersection turn
+    # Same pattern as STRAIGHT: STOP → DECIDE committed side → GO.
+    # The inner edge (left on a LEFT turn, right on a RIGHT turn) is a
+    # hard standoff. The buggy sits near lane centre and never touches
+    # the inside line — like real driving.
+    # ==================================================================
+    def _turn_allowed(self):
+        return (
+            self.turn_enable and
+            self.current_mission in ("LEFT", "RIGHT") and
+            self.mission_state in (
+                MissionState.NORMAL_LINE_FOLLOWING,
+                MissionState.NAVIGATING_TO_NEXT_TARGET,
+                MissionState.WAITING_FOR_SAFE_ZONE,
+            )
+        )
+
+    def _reset_turn_state(self, clear_completed=False):
+        was_active = self._turn_mode != TurnMode.INACTIVE
+        self._turn_mode = TurnMode.INACTIVE
+        self._turn_side = None
+        self._turn_entry_time = None
+        self._turn_search_start_time = None
+        self._turn_search_cmd = 0.0
+        self._turn_search_bump_time = None
+        self._turn_stable_count = 0
+        self._turn_lost_count = 0
+        self._turn_seen_count = 0
+        self._turn_target_visible = False
+        self._turn_target_x = None
+        self._turn_outer_x = None
+        self._turn_last_reason = ""
+        self._turn_no_safe_path = False
+        self._turn_lane_safe = True
+        self._turn_inner_clear_px = None
+        self._turn_decided = False
+        self._turn_both_count = 0
+        if clear_completed:
+            self._turn_completed = False
+        if was_active:
+            self.get_logger().info("LEFT/RIGHT turn state cleared")
+
+    def _enter_turn(self, reason):
+        self._turn_mode = TurnMode.SEARCH
+        self._turn_side = self.current_mission
+        self._turn_entry_time = time.time()
+        self._turn_search_start_time = self._turn_entry_time
+        self._turn_search_cmd = self.turn_search_steer_min
+        self._turn_search_bump_time = self._turn_entry_time
+        self._turn_stable_count = 0
+        self._turn_lost_count = 0
+        self._turn_seen_count = 0
+        self._turn_completed = False
+        self._turn_decided = True
+        self._turn_no_safe_path = False
+        self._turn_last_reason = reason
+        self.integral = 0.0
+        self.prev_time = None
+        self.get_logger().info(
+            f"*** Entering {self._turn_side} turn  reason={reason}\n"
+            f"    Keep rolling, yaw {self._turn_side} until the "
+            f"{self._turn_side.lower()} vector is seen, then follow "
+            f"it at {self.turn_follow_offset_frac:.0%} lane.")
+
+    def _exit_turn(self, reason):
+        side = self._turn_side or self.current_mission
+        elapsed = 0.0
+        if self._turn_entry_time is not None:
+            elapsed = time.time() - self._turn_entry_time
+        self.get_logger().info(
+            f"*** Exiting {side} turn  reason={reason}  "
+            f"elapsed={elapsed:.2f}s  stable={self._turn_stable_count}  "
+            "→ normal centre-following")
+        self.integral = 0.0
+        self.prev_time = None
+        self._turn_completed = True
+        if reason in ("timeout", "watchdog"):
+            self._turn_cooldown_until = (
+                time.time() + self.turn_cooldown_after_timeout)
+            self.last_good_turn *= 0.4
+        self._turn_mode = TurnMode.INACTIVE
+        self._turn_side = None
+        self._turn_entry_time = None
+        self._turn_stable_count = 0
+        self._turn_lost_count = 0
+        self._turn_seen_count = 0
+        self._turn_target_visible = False
+        self._turn_target_x = None
+        self._turn_outer_x = None
+        self._turn_last_reason = reason
+        self._turn_no_safe_path = False
+        self._turn_decided = False
+        self._turn_both_count = 0
+
+    def _turn_search_sign(self):
+        side = self._turn_side or self.current_mission
+        return -1.0 if side == "LEFT" else 1.0
+
+    def _turn_ref_width(self):
+        if self.learned_lane_width > 0.0:
+            return self.learned_lane_width
+        return self.lane_width_px
+
+    def _turn_inner_margin(self, lane_width):
+        """Touch-only gap from the inner line. Small on purpose.
+
+        A large margin during a LEFT turn pushes the buggy RIGHT and
+        out of the opening (see logs: 32 px clear → +0.38 steer).
+        """
+        width = max(0.0, float(lane_width))
+        return max(
+            float(self.turn_inner_margin_px),
+            self.turn_inner_margin_ratio * width)
+
+    def _turn_search_steer_now(self):
+        """Start at 0.20 and ramp up while the inner vector is still lost."""
+        start = self.turn_search_steer_min
+        # Hard cap: a big blind yaw drives the buggy out of the lane.
+        end = max(start, min(0.36, self.turn_search_steer))
+        t0 = self._turn_search_start_time or self._turn_entry_time
+        if t0 is None:
+            return start
+        elapsed = max(0.0, time.time() - t0)
+        ramp = max(0.4, self.turn_search_ramp_time)
+        alpha = min(1.0, elapsed / ramp)
+        alpha = alpha * alpha * (3.0 - 2.0 * alpha)
+        return start + (end - start) * alpha
+
+    def _apply_turn_search_command(self):
+        """Keep rolling. Yaw starts gentle and grows until the line is seen."""
+        if self._turn_search_start_time is None:
+            self._turn_search_start_time = time.time()
+        sign = self._turn_search_sign()
+        mag = self._turn_search_steer_now()
+        self._turn_no_safe_path = False
+        self._turn_lane_safe = True
+        self._turn_mode = TurnMode.SEARCH
+        self.target_turn = max(TURN_MIN, min(TURN_MAX, sign * mag))
+        self.target_speed = self.turn_search_speed
+        self.vectors_available = True
+        self.last_good_turn = self.target_turn
+        self.error = sign * 0.70
+
+    def _note_width_sample(self, lane_width):
+        if lane_width is None or lane_width <= 0.0:
+            return
+        if self._width_ema_samples == 0:
+            self._width_ema = lane_width
+        else:
+            self._width_ema = 0.15 * lane_width + 0.85 * self._width_ema
+        self._width_ema_samples += 1
+
+    def _classify_turn_edges(
+            self, count, side, img_center,
+            left_x, right_x, left_heading, right_heading,
+            single_aim, single_heading, current_heading,
+            left_bottom, right_bottom):
+        """Return inner/outer edge observations for this turn."""
+        inner_x = outer_x = None
+        inner_heading = outer_heading = None
+        inner_bottom = outer_bottom = None
+        inner_visible = outer_visible = False
+
+        if count >= 2 and left_x is not None and right_x is not None:
+            inner_visible = True
+            outer_visible = True
+            if side == "LEFT":
+                inner_x, outer_x = left_x, right_x
+                inner_heading = (
+                    left_heading if left_heading is not None
+                    else current_heading)
+                outer_heading = (
+                    right_heading if right_heading is not None
+                    else current_heading)
+                inner_bottom, outer_bottom = left_bottom, right_bottom
+            else:
+                inner_x, outer_x = right_x, left_x
+                inner_heading = (
+                    right_heading if right_heading is not None
+                    else current_heading)
+                outer_heading = (
+                    left_heading if left_heading is not None
+                    else current_heading)
+                inner_bottom, outer_bottom = right_bottom, left_bottom
+        elif count == 1 and single_aim is not None:
+            # Accept the inner line even if it has drifted past image
+            # centre — otherwise we "lose" the left vector too early
+            # and slam SEARCH.
+            band = self.turn_see_band_frac * max(1.0, img_center)
+            if side == "LEFT":
+                is_inner = single_aim < img_center + band
+            else:
+                is_inner = single_aim > img_center - band
+            if is_inner:
+                inner_visible = True
+                inner_x = single_aim
+                inner_heading = single_heading
+            else:
+                outer_visible = True
+                outer_x = single_aim
+                outer_heading = single_heading
+        return {
+            "inner_visible": inner_visible,
+            "outer_visible": outer_visible,
+            "inner_x": inner_x,
+            "outer_x": outer_x,
+            "inner_heading": inner_heading,
+            "outer_heading": outer_heading,
+            "inner_bottom": inner_bottom,
+            "outer_bottom": outer_bottom,
+        }
+
+    def _desired_inner_offset(self, ref_width):
+        """Sit ~38% of lane off the inner line: not on the paint, not
+        out the far side."""
+        w = max(1.0, float(ref_width))
+        return max(70.0, min(0.48 * w, self.turn_follow_offset_frac * w))
+
+    def _turn_aim_from_inner(self, side, inner_x, outer_x, ref_width):
+        """Aim on a path parallel to the inner line, still inside the lane."""
+        margin = self._turn_inner_margin(ref_width)
+        offset = self._desired_inner_offset(ref_width)
+        virtual_half = 0.48 * max(ref_width, 1.0)
+        if side == "LEFT":
+            lane_center = inner_x + offset
+            lo = inner_x + margin
+            hi = inner_x + virtual_half
+            if outer_x is not None and outer_x > inner_x:
+                hi = min(hi, outer_x - 0.70 * margin)
+            if hi <= lo:
+                return 0.5 * (lo + max(hi, lo + 1.0))
+            return max(lo, min(hi, lane_center))
+        lane_center = inner_x - offset
+        hi = inner_x - margin
+        lo = inner_x - virtual_half
+        if outer_x is not None and inner_x > outer_x:
+            lo = max(lo, outer_x + 0.70 * margin)
+        if hi <= lo:
+            return 0.5 * (lo + hi)
+        return max(lo, min(hi, lane_center))
+
+    def _turn_aim_from_outer(self, side, outer_x, ref_width):
+        """Reconstruct the lane from the outer edge and sit at its centre.
+
+        Then add only a small opening bias. This starts the turn from
+        mid-lane instead of diving toward an unseen inner curb.
+        """
+        margin = self._turn_inner_margin(ref_width)
+        if side == "LEFT":
+            virtual_inner = outer_x - ref_width
+            center = virtual_inner + 0.50 * ref_width
+            center -= self.turn_search_bias_frac * ref_width
+            return min(center, outer_x - margin)
+        virtual_inner = outer_x + ref_width
+        center = virtual_inner - 0.50 * ref_width
+        center += self.turn_search_bias_frac * ref_width
+        return max(center, outer_x + margin)
+
+    def _publish_turn_aim(self, now, img_center, lane_center, heading,
+                          speed, extra_turn=0.0):
+        if img_center <= 0.0:
+            self._apply_turn_search_command()
+            return
+        raw_error = (lane_center - img_center) / img_center
+        self.error = max(-1.0, min(1.0, raw_error))
+        turn = self._compute_pid(self.error, now)
+        if heading is not None:
+            ff = heading * self.turn_follow_heading_gain
+            ff = max(-self.turn_follow_heading_max,
+                     min(self.turn_follow_heading_max, ff))
+            turn += ff
+        turn += extra_turn
+        safe_turn, lane_safe = self._enforce_turn_lane_safety(turn, now)
+        self._turn_lane_safe = lane_safe
+        self.target_turn = safe_turn
+        self._turn_no_safe_path = False
+        if (self.turn_stop_on_unsafe and not lane_safe and
+                self._turn_target_visible):
+            # Real inner edge is too close: creep off it. Never freeze.
+            self.target_speed = min(
+                max(speed, 0.18),
+                max(0.20, 0.70 * self.turn_search_speed))
+        else:
+            self.target_speed = max(SPEED_MIN, min(SPEED_MAX, speed))
+        self.vectors_available = True
+        self.last_vector_time = now
+        self.last_good_turn = self.target_turn
+
+    def _enforce_turn_lane_safety(self, turn, now):
+        """Keep a real gap from the inner line; stay inside the lane.
+
+        < 20 px : emergency steer away (do not touch).
+        < 36 px : no steer toward the line, add a push-away.
+        else    : allow the left/right turn, but cap the away-steer so
+                  we do not fly out the far side of the lane.
+        """
+        if not self._turn_target_visible:
+            self._turn_inner_clear_px = None
+            return max(TURN_MIN, min(TURN_MAX, turn)), True
+
+        side = self._turn_side or self.current_mission
+        img_c = self._lane_safety_image_center
+        if img_c <= 0.0:
+            img_c = getattr(self, '_turn_img_center', 0.0)
+        if self._turn_target_x is not None and img_c > 0.0:
+            if side == "LEFT":
+                inner_clear = img_c - self._turn_target_x
+            else:
+                inner_clear = self._turn_target_x - img_c
+        else:
+            clearances = self._lane_clearances(now)
+            if clearances is None:
+                return max(TURN_MIN, min(TURN_MAX, turn)), True
+            left_clear, right_clear, _lw = clearances
+            inner_clear = left_clear if side == "LEFT" else right_clear
+
+        self._turn_inner_clear_px = inner_clear
+        touch = max(24.0, float(self.turn_inner_margin_px))
+        if inner_clear < 20.0:
+            away = 0.45
+            if side == "LEFT":
+                turn = max(turn, away)
+            else:
+                turn = min(turn, -away)
+            return max(TURN_MIN, min(TURN_MAX, turn)), False
+        if inner_clear < touch:
+            deficit = (touch - inner_clear) / touch
+            away = 0.14 + 0.28 * deficit
+            if side == "LEFT":
+                turn = max(0.0, turn)
+                turn = max(turn, away)
+            else:
+                turn = min(0.0, turn)
+                turn = min(turn, -away)
+            return max(TURN_MIN, min(TURN_MAX, turn)), False
+        # In the safe band: do not allow a huge away-steer out of lane.
+        if side == "LEFT" and turn > 0.40:
+            turn = 0.40
+        elif side == "RIGHT" and turn < -0.40:
+            turn = -0.40
+        return max(TURN_MIN, min(TURN_MAX, turn)), True
+
+    def _update_left_right_turn(
+            self, now, img_center, count,
+            left_x=None, right_x=None,
+            left_heading=None, right_heading=None,
+            single_side=None, single_aim=None, single_heading=None,
+            lane_width=None, current_heading=None,
+            left_bottom=None, right_bottom=None):
+        """Drive the LEFT/RIGHT turn FSM.
+
+        Returns True when target_turn/target_speed are already set and the
+        caller must return. Returns False to fall through to normal following.
+        """
+        if not self._turn_allowed():
+            if self._turn_mode != TurnMode.INACTIVE:
+                self._reset_turn_state()
+            return False
+
+        side = self.current_mission
+        edges = self._classify_turn_edges(
+            count, side, img_center,
+            left_x, right_x, left_heading, right_heading,
+            single_aim, single_heading, current_heading,
+            left_bottom, right_bottom)
+        inner_visible = edges["inner_visible"]
+        outer_visible = edges["outer_visible"]
+        inner_x = edges["inner_x"]
+        outer_x = edges["outer_x"]
+        inner_heading = edges["inner_heading"]
+        ref_width = self._turn_ref_width()
+        if (lane_width is not None and lane_width > 0.0 and
+                lane_width < ref_width * 2.5):
+            ref_width = max(ref_width * 0.5, min(ref_width, lane_width))
+
+        self._turn_target_visible = inner_visible
+        self._turn_target_x = inner_x
+        self._turn_outer_x = outer_x
+        self._turn_img_center = img_center
+        if img_center > 0.0:
+            self._lane_safety_image_center = img_center
+        self._turn_no_safe_path = False
+
+        # -------- entry while still in normal mode --------
+        if self._turn_mode == TurnMode.INACTIVE:
+            if now < self._turn_cooldown_until:
+                return False
+            should_enter = False
+            reason = ""
+            if count >= 2 and lane_width is not None and lane_width > 0.0:
+                if (self.learned_lane_width > 0.0 and
+                        lane_width > self.learned_lane_width *
+                        self.turn_entry_width_ratio):
+                    should_enter = True
+                    reason = "wide"
+                elif (self._width_ema_samples >=
+                      self.intersect_width_samples_for_spike and
+                      self._width_ema > 0.0 and
+                      lane_width > self._width_ema *
+                      self.turn_entry_spike_ratio):
+                    should_enter = True
+                    reason = "spike"
+            if count == 1 and not inner_visible:
+                self._turn_lost_count += 1
+                if self._turn_lost_count >= self.turn_lost_confirm_frames:
+                    should_enter = True
+                    reason = f"lost_{side.lower()}_vector"
+            elif count == 0:
+                self._turn_lost_count += 1
+                if self._turn_lost_count >= self.turn_lost_confirm_frames:
+                    should_enter = True
+                    reason = "no_vectors"
+            else:
+                self._turn_lost_count = 0
+            if not should_enter:
+                return False
+            self._enter_turn(reason)
+
+        if inner_visible and inner_x is not None:
+            self._turn_seen_count += 1
+            self._turn_lost_count = 0
+        else:
+            self._turn_seen_count = 0
+            self._turn_lost_count += 1
+
+        # Both lane edges back → normal centre-following.
+        if (self._turn_mode != TurnMode.INACTIVE and
+                count >= 2 and inner_visible and outer_visible):
+            self._turn_both_count = getattr(self, '_turn_both_count', 0) + 1
+            if self._turn_both_count >= 3:
+                self._exit_turn("both_vectors")
+                return False
+        else:
+            self._turn_both_count = 0
+
+        if self._turn_mode == TurnMode.DECIDE:
+            self._turn_mode = TurnMode.SEARCH
+            self._turn_decided = True
+
+        if (not inner_visible and
+                self._turn_lost_count >= self.turn_lost_confirm_frames):
+            if self._turn_mode != TurnMode.SEARCH:
+                self._turn_search_start_time = now
+                self._turn_search_cmd = self.turn_search_steer_min
+                self._turn_search_bump_time = now
+                self.get_logger().info(
+                    f"*** {side} turn  FOLLOW → SEARCH  "
+                    f"(no {side.lower()} vector — start "
+                    f"{self.turn_search_steer_min:.2f}, "
+                    f"+{getattr(self, 'turn_search_increase_frac', 0.10):.0%} each "
+                    f"{getattr(self, 'turn_search_increase_dt', 0.25):.2f}s)")
+            self._turn_mode = TurnMode.SEARCH
+            self._turn_stable_count = 0
+
+        if (inner_visible and
+                self._turn_seen_count >= self.turn_follow_confirm_frames and
+                self._turn_mode == TurnMode.SEARCH):
+            self._turn_mode = TurnMode.FOLLOW
+            self.get_logger().info(
+                f"*** {side} turn  SEARCH → FOLLOW  "
+                f"inner x={inner_x:.1f}  "
+                f"standoff={self.turn_follow_offset_frac:.0%} of lane "
+                "(do not touch the line)")
+
+        if self._turn_mode == TurnMode.SEARCH or not inner_visible:
+            sign = self._turn_search_sign()
+            if outer_visible and outer_x is not None:
+                # Outer line is only a far-wall constraint. The opening is
+                # the missing inner side — keep yawing that way.
+                lane_center = self._turn_aim_from_outer(
+                    side, outer_x, self._turn_ref_width())
+                extra = sign * self._turn_search_steer_now()
+                self._publish_turn_aim(
+                    now, img_center, lane_center, current_heading,
+                    self.turn_search_speed, extra_turn=extra)
+            else:
+                self._apply_turn_search_command()
+                self.last_vector_time = now
+            return True
+
+        # -------- FOLLOW: track the inner edge at a real-driving gap --------
+        lane_center = self._turn_aim_from_inner(
+            side, inner_x, outer_x, self._turn_ref_width())
+
+        if count >= 2 and lane_width is not None:
+            width_ok = (
+                lane_width > 0.0 and
+                lane_width <= self.learned_lane_width *
+                self.turn_exit_width_ratio)
+            heading_ok = True
+            if current_heading is not None:
+                heading_ok = (
+                    abs(current_heading) <=
+                    math.radians(self.turn_exit_heading_deg))
+            elapsed = 0.0
+            if self._turn_entry_time is not None:
+                elapsed = now - self._turn_entry_time
+            min_time_ok = elapsed >= self.turn_min_time
+            if width_ok and heading_ok and min_time_ok:
+                self._turn_stable_count += 1
+                if self._turn_stable_count >= self.turn_exit_stable_frames:
+                    self._exit_turn("recovery")
+                    return False
+            else:
+                self._turn_stable_count = 0
+        else:
+            self._turn_stable_count = 0
+
+        severity_speed = max(
+            self.speed_sharp * 0.55,
+            self.turn_follow_speed)
+        self._publish_turn_aim(
+            now, img_center, lane_center, inner_heading, severity_speed)
+        if abs(self.target_turn) > 0.35:
+            self.target_speed = max(
+                self.speed_sharp * 0.55,
+                self.target_speed - 0.12)
+        return True
+
+    def _finish_turn_decide(self, side, inner_visible):
+        if self._turn_decided:
+            return
+        self._turn_decided = True
+        if inner_visible:
+            self._turn_mode = TurnMode.FOLLOW
+            nxt = "FOLLOW inner edge at standoff"
+        else:
+            self._turn_mode = TurnMode.SEARCH
+            nxt = "SEARCH (inner edge not yet visible)"
+        self.get_logger().info(
+            f"*** {side} turn  DECIDE complete → {nxt}")
+
+    def _log_turn_mode(self, now, steering, speed):
+        if not self.debug_log or now - self._turn_debug_log_time < 0.5:
+            return
+        self._turn_debug_log_time = now
+        side = self._turn_side or self.current_mission
+        tx = (f"{self._turn_target_x:.1f}"
+              if self._turn_target_x is not None else "n/a")
+        ox = (f"{self._turn_outer_x:.1f}"
+              if self._turn_outer_x is not None else "n/a")
+        inner = (f"{self._turn_inner_clear_px:.0f}px"
+                 if self._turn_inner_clear_px is not None else "n/a")
+        self.get_logger().info(
+            f"LEFT/RIGHT TURN\n"
+            f"---------------\n"
+            f"Mission     : {side}\n"
+            f"Mode        : {self._turn_mode}\n"
+            f"Inner vec   : "
+            f"{'YES' if self._turn_target_visible else 'NO'}  x={tx}\n"
+            f"Outer vec   : x={ox}\n"
+            f"Inner clear : {inner}\n"
+            f"Lane safe   : {'YES' if self._turn_lane_safe else 'NO'}\n"
+            f"Decided     : {'YES' if self._turn_decided else 'NO'}\n"
+            f"Steering    : {steering:+.3f}\n"
+            f"Speed       : {speed:.2f}\n"
+            f"Reason      : {self._turn_last_reason}")
+
     # Intersection helpers
     def _reset_intersection_state(self):
         self._in_intersection = False
@@ -1510,6 +2210,8 @@ class LineFollower(Node):
                 vec_left, vec_right = v2, v1
             lane_width = right_x - left_x
             current_heading = self._lane_heading(vec_left, vec_right)
+            left_heading = self._vector_heading(vec_left)
+            right_heading = self._vector_heading(vec_right)
 
             # Conservative two-edge road corridor for the final green-guidance
             # supervisor. Use the inward-most lookahead/near-field boundaries;
@@ -1690,27 +2392,46 @@ class LineFollower(Node):
                 self.last_good_turn = self.target_turn
                 return
 
+            # LEFT / RIGHT — two vectors
+            self._note_width_sample(lane_width)
+            if self._update_left_right_turn(
+                    now, img_center, count,
+                    left_x=left_x, right_x=right_x,
+                    left_heading=left_heading, right_heading=right_heading,
+                    lane_width=lane_width, current_heading=current_heading,
+                    left_bottom=left_x_bottom, right_bottom=right_x_bottom):
+                return
+
+            # Pre-turn approach or post-turn normal centre-following.
             junction_wide = (
                 self.learned_lane_width > 0.0 and
                 lane_width > self.learned_lane_width *
                 self.junction_width_ratio)
-            ref_width = self.learned_lane_width if junction_wide else lane_width
-            if self.current_mission == "LEFT":
-                offset = self._clamped_offset(0.42 * ref_width, ref_width)
-                lane_center = left_x + offset
-            elif self.current_mission == "RIGHT":
-                offset = self._clamped_offset(0.42 * ref_width, ref_width)
-                lane_center = right_x - offset
+            lane_center = 0.5 * (left_x + right_x)
+            if (not self._turn_completed and
+                    self.current_mission in ("LEFT", "RIGHT")):
+                ref_w = self.learned_lane_width if junction_wide else lane_width
+                bias = self.turn_approach_bias_frac * max(ref_w, 1.0)
+                if self.current_mission == "LEFT":
+                    lane_center -= bias
+                elif self.current_mission == "RIGHT":
+                    lane_center += bias
             if junction_wide:
+                ref_width = self.learned_lane_width
                 if self.current_mission == "LEFT":
                     lane_center = self._clamp_to_lane(
                         lane_center, left_x, left_x + ref_width)
                 elif self.current_mission == "RIGHT":
                     lane_center = self._clamp_to_lane(
                         lane_center, right_x - ref_width, right_x)
+                else:
+                    lane_center = self._clamp_to_lane(
+                        lane_center, left_x, right_x,
+                        left_x_bottom, right_x_bottom)
             else:
                 lane_center = self._clamp_to_lane(
-                    lane_center, left_x, right_x)
+                    lane_center, left_x, right_x,
+                    left_x_bottom, right_x_bottom)
             self.vectors_available = True
             tail_curvature = current_heading
             if self.learn_lane_width and not junction_wide:
@@ -1778,6 +2499,15 @@ class LineFollower(Node):
                     self.last_good_turn = self.target_turn
                     return
 
+            if self._update_left_right_turn(
+                    now, img_center, count,
+                    single_side=self.last_single_side,
+                    single_aim=aim,
+                    single_heading=one_vec_heading,
+                    lane_width=lane_width,
+                    current_heading=one_vec_heading):
+                return
+
             offset = self._clamped_offset(0.50 * lane_width, lane_width)
             apex_pull = 0.0
             outer_side = 'RIGHT' if one_vec_heading > 0.0 else 'LEFT'
@@ -1814,6 +2544,9 @@ class LineFollower(Node):
                     self.intersect_cte_gain * cte)
                 self.target_turn = max(TURN_MIN, min(TURN_MAX, turn))
                 self.target_speed = self.intersect_speed
+                return
+            if self._update_left_right_turn(
+                    now, img_center, 0):
                 return
             self.vectors_available = False
             return
@@ -1976,10 +2709,12 @@ class LineFollower(Node):
 
         if self.mission_state == MissionState.MISSION_COMPLETE:
             self._reset_straight_green_guidance()
+            self._reset_turn_state()
             self.publish_drive_cmd(0.0, 0.0)
             return
         if self.mission_state == MissionState.WAITING_FOR_SERVER_ACK:
             self._reset_straight_green_guidance()
+            self._reset_turn_state()
             self.publish_drive_cmd(0.0, 0.0)
             if now - self._wait_log_time >= 1.0:
                 self._wait_log_time = now
@@ -1989,12 +2724,14 @@ class LineFollower(Node):
             return
         if self.mission_state == MissionState.PARKED_IN_SAFE_ZONE:
             self._reset_straight_green_guidance()
+            self._reset_turn_state()
             self.publish_drive_cmd(0.0, 0.0)
             return
 
         if self.mission_state == MissionState.ENTERING_SAFE_ZONE:
             # Parking remains entirely on the original controller path.
             self._reset_straight_green_guidance()
+            self._reset_turn_state()
             self._update_travel_distance(now)
             self._run_parking_check(now)
             if self.mission_state == MissionState.PARKED_IN_SAFE_ZONE:
@@ -2023,6 +2760,24 @@ class LineFollower(Node):
             green_allowed and
             self._green_guidance_mode != StraightGuidanceMode.INACTIVE)
 
+        turn_allowed = self._turn_allowed()
+        if not turn_allowed and self._turn_mode != TurnMode.INACTIVE:
+            self._reset_turn_state()
+        if (turn_allowed and self._turn_mode != TurnMode.INACTIVE and
+                self._turn_entry_time is not None and
+                now - self._turn_entry_time > self.turn_max_time):
+            # Keep a gentle search instead of dumping into NORM (that
+            # left the lane). Do not slam.
+            self._turn_mode = TurnMode.SEARCH
+            self._turn_entry_time = now
+            self.get_logger().info(
+                f"*** {self.current_mission} turn still open — "
+                f"hold SEARCH at "
+                f"{self._turn_search_steer_now():+.2f}")
+
+        turn_control_active = (
+            turn_allowed and self._turn_mode != TurnMode.INACTIVE)
+
         if green_control_active:
             # target_turn/target_speed are the existing safe STRAIGHT
             # intersection fallback. Green guidance adds a target direction;
@@ -2030,6 +2785,33 @@ class LineFollower(Node):
             # inside this isolated controller.
             want_turn, want_speed = self._compute_straight_green_control(
                 now, self.target_turn, self.target_speed)
+        elif turn_control_active:
+            # Quiet camera during SEARCH: keep the yaw, do not stop.
+            if (self._turn_mode == TurnMode.SEARCH and
+                    (self.last_vector_time is None or
+                     now - self.last_vector_time > 0.30)):
+                self._apply_turn_search_command()
+            want_turn = self.target_turn
+            want_speed = max(self.target_speed, self.turn_search_speed * 0.85)
+            if self._turn_mode == TurnMode.FOLLOW:
+                want_speed = self.target_speed
+            if self.obstacle_detected:
+                turn_sign = self._turn_search_sign()
+                obs_sign = (
+                    1.0 if self.obstacle_turn > 0.0
+                    else -1.0 if self.obstacle_turn < 0.0 else 0.0)
+                if obs_sign == turn_sign:
+                    want_turn = max(
+                        TURN_MIN, min(
+                            TURN_MAX,
+                            0.45 * self.target_turn + 0.55 * self.obstacle_turn))
+                else:
+                    want_turn = max(
+                        TURN_MIN, min(
+                            TURN_MAX,
+                            0.85 * self.target_turn + 0.15 * self.obstacle_turn))
+                want_speed = min(want_speed, self.obstacle_speed)
+            self._log_turn_mode(now, want_turn, want_speed)
         elif self.obstacle_detected:
             # Original obstacle behavior for LEFT/RIGHT, normal road and every
             # non-green state is preserved exactly.
@@ -2090,14 +2872,33 @@ class LineFollower(Node):
                 final_speed = 0.0
             self._log_straight_green_guidance(
                 now, final_turn, final_speed)
+        elif turn_control_active:
+            # Clamp only a REAL inner edge. Never stop to "decide".
+            final_turn, lane_safe = self._enforce_turn_lane_safety(
+                final_turn, now)
+            self._turn_lane_safe = lane_safe
+            if self._turn_mode == TurnMode.SEARCH:
+                want = (self._turn_search_sign() *
+                        self._turn_search_steer_now())
+                if abs(final_turn) < abs(want) * 0.60:
+                    final_turn = want
+                final_speed = max(final_speed, self.turn_search_speed)
+            elif (self.turn_stop_on_unsafe and not lane_safe and
+                  self._turn_target_visible):
+                final_speed = max(
+                    0.18, min(final_speed, self.turn_search_speed))
+            self._log_turn_mode(now, final_turn, final_speed)
 
         self.publish_drive_cmd(final_speed, self.steer_sign * final_turn)
 
         self._tick += 1
         if self.debug_log and self._tick % 15 == 0:
-            mode = (
-                'INT' if self._in_intersection else
-                ('OBS' if self.obstacle_detected else 'NORM'))
+            if self._turn_mode != TurnMode.INACTIVE:
+                mode = self._turn_mode
+            else:
+                mode = (
+                    'INT' if self._in_intersection else
+                    ('OBS' if self.obstacle_detected else 'NORM'))
             self.get_logger().info(
                 f"vec={'Y' if self.vectors_available else 'N'} "
                 f"side={self.last_single_side} "
@@ -2557,3 +3358,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+
