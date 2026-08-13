@@ -1090,6 +1090,16 @@ class LineFollower(Node):
                 f"{received} ignored in state {self.mission_state}")
             return
         if received == "MISSION_COMPLETE":
+            if (self.mission_state == MissionState.BONUS_PARKING and
+                    getattr(self, '_bp_mode', "BP_OFF") not in
+                    ("BP_OFF", "BP_DONE")):
+                # Parking approach/reverse is still running. Halting now
+                # would strand the buggy outside the parking box and the
+                # PARKED handshake would never get a chance to succeed.
+                self.get_logger().info(
+                    "MISSION_COMPLETE ignored — bonus parking still in "
+                    f"progress (mode={getattr(self, '_bp_mode', 'BP_OFF')})")
+                return
             self._complete_active_mission("MISSION_COMPLETE received")
             self._transition_mission_state(
                 MissionState.MISSION_COMPLETE,
@@ -4022,4 +4032,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
