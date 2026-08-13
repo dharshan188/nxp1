@@ -78,6 +78,11 @@ GOAL_TO_HOSPITAL_NUM = {"X": 4, "Y": 5, "Z": 6}
 
 VALID_MISSION_PAYLOADS = {"A", "B", "C", "X", "Y", "Z", "OK", "INVALID"}
 
+# Bonus parking: resend PARKED on this interval until the server says OK.
+PARKED_INTERVAL_SEC = 5.0
+# 3 patient picks (A/B/C) + 3 hospital drops (X/Y/Z).
+TOTAL_MISSION_LEGS = 6
+
 # Frames in a row without the verified QR before we say it left the camera.
 QR_GONE_CONFIRM_FRAMES = 6
 
@@ -163,6 +168,7 @@ class QRDetector(Node):
         self.bonus_active = False
         self.bonus_ok = False
         self._last_parked_send = None
+        self._parked_attempts = 0
 
         # Visibility of the successfully-verified QR (print + /qr_not_visible).
         self._reset_verified_visibility()
@@ -316,11 +322,12 @@ class QRDetector(Node):
         kind = ("patient pick" if goal in ("A", "B", "C")
                 else "hospital drop")
         banner = (
-            f"*** LEG {self.mission_leg_count}/6  {kind}  goal={goal}\n"
+            f"*** LEG {self.mission_leg_count}/{TOTAL_MISSION_LEGS}  {kind}  "
+            f"goal={goal}\n"
             f"    done={sorted(self._completed_legs)}")
         self.get_logger().info(banner)
         print(banner, flush=True)
-        if self.mission_leg_count >= 6:
+        if self.mission_leg_count >= TOTAL_MISSION_LEGS:
             self._start_bonus()
 
     def _start_bonus(self):
@@ -329,31 +336,41 @@ class QRDetector(Node):
         self.bonus_active = True
         self.bonus_ok = False
         self._last_parked_send = None
+        self._parked_attempts = 0
         msg = String()
         msg.data = "BONUS"
         self.publisher_bonus.publish(msg)
         banner = (
             "==========================================\n"
-            "BONUS  all 6 legs done (3 pick + 3 drop)\n"
+            f"BONUS  all {TOTAL_MISSION_LEGS} legs done (3 pick + 3 drop)\n"
             "Published /bonus = BONUS\n"
             "Line follower: 2-lane reverse+straight park\n"
-            "Then PARKED to server every 4 s until OK\n"
+            f"Then PARKED to server every {PARKED_INTERVAL_SEC:.0f} s "
+            "until OK\n"
             "==========================================")
         self.get_logger().info(banner)
         print(banner, flush=True)
 
     def _bonus_parked_tick(self):
-        """While bonus is active, send PARKED every 4 s (multiples allowed)."""
+        """While bonus is active, send PARKED every 5 s until server OK.
+
+        Self-driving: it does not need /safe_zone to start. Once /bonus has
+        fired, PARKED goes out every 5 s and keeps going on INVALID; only a
+        server "OK" stops it.
+        """
         if not self.bonus_active or self.bonus_ok:
             return
         now = time.time()
         if (self._last_parked_send is not None and
-                now - self._last_parked_send < 4.0):
+                now - self._last_parked_send < PARKED_INTERVAL_SEC):
             return
         if self.comm_state == COMM_WAITING_ACK:
             return
+        self._parked_attempts += 1
         self.get_logger().info(
-            "BONUS: publishing PARKED to /ServerCommunication")
+            f"BONUS: publishing PARKED to /ServerCommunication "
+            f"(attempt {self._parked_attempts}, every "
+            f"{PARKED_INTERVAL_SEC:.0f} s until OK)")
         self.send_mission_to_server("PARKED")
         self._last_parked_send = now
 
@@ -371,7 +388,7 @@ class QRDetector(Node):
             f"FSM: {self.fsm_state} | Comm: {self.comm_state}\n"
             f"Expected QR: {self.expected_qr} | Verified: {self.verified_qr} "
             f"(qr_verified={self.qr_verified})\n"
-            f"Legs done: {self.mission_leg_count}/6 "
+            f"Legs done: {self.mission_leg_count}/{TOTAL_MISSION_LEGS} "
             f"{sorted(self._completed_legs)}\n"
             f"Bonus: active={self.bonus_active} ok={self.bonus_ok}\n"
             f"==========================================\n"
@@ -659,7 +676,7 @@ class QRDetector(Node):
             f"--------------------------------\n"
         )
 
-        # Bonus park finished: start / keep PARKED every 4 s.
+        # Bonus park finished: start / keep the PARKED loop running.
         if self.bonus_active:
             if self.comm_state != COMM_WAITING_ACK:
                 self.send_mission_to_server("PARKED")
@@ -730,7 +747,9 @@ class QRDetector(Node):
         if payload_upper == "INVALID":
             if self.bonus_active and not self.bonus_ok:
                 self.get_logger().info(
-                    "BONUS: server INVALID — keep sending PARKED every 4 s")
+                    f"BONUS: server INVALID — keep sending PARKED every "
+                    f"{PARKED_INTERVAL_SEC:.0f} s until OK "
+                    f"(attempt {self._parked_attempts})")
                 self.comm_state = COMM_IDLE
                 self.pending_outgoing_msg = None
                 return
@@ -746,13 +765,38 @@ class QRDetector(Node):
             self.get_logger().info(
                 f"MISSION FINISHED - Received OK -> {MISSION_COMPLETE}"
             )
-            if self.bonus_active:
+            # A PARKED must actually have been sent for this OK to be the
+            # parking confirmation. Otherwise this is the OK for the final
+            # hospital leg, which arrives while bonus parking is only just
+            # starting — halting the runner there would strand the buggy.
+            parking_ok = (self._parked_attempts > 0 and
+                          (self.bonus_active or self.bonus_ok))
+            if parking_ok:
                 self.bonus_ok = True
                 self.bonus_active = False
+                self.mission_state = MISSION_COMPLETE
+                self._publish_resume_line_following("MISSION_COMPLETE")
+                banner = (
+                    "==========================================\n"
+                    "BONUS: server OK — parking confirmed\n"
+                    f"PARKED attempts: {self._parked_attempts}\n"
+                    "RUN COMPLETE - BONUS PART FINISHED\n"
+                    "==========================================")
+                self.get_logger().info(banner)
+                print(banner, flush=True)
+            elif (self.bonus_active or
+                  self.mission_leg_count >= TOTAL_MISSION_LEGS):
+                # Final-leg OK while parking is under way. Do NOT send
+                # MISSION_COMPLETE: it would stop the line follower dead
+                # and the buggy would never reach the parking box.
+                self.mission_state = MISSION_COMPLETE
                 self.get_logger().info(
-                    "BONUS: server OK — stop PARKED loop")
-            self.mission_state = MISSION_COMPLETE
-            self._publish_resume_line_following("MISSION_COMPLETE")
+                    f"All {TOTAL_MISSION_LEGS} legs done — suppressing "
+                    "MISSION_COMPLETE so the bonus parking run can finish "
+                    f"(PARKED every {PARKED_INTERVAL_SEC:.0f} s until OK)")
+            else:
+                self.mission_state = MISSION_COMPLETE
+                self._publish_resume_line_following("MISSION_COMPLETE")
             self.qr_verified = False
             self.verified_qr = None
             self.expected_qr = None
@@ -1027,7 +1071,8 @@ class QRDetector(Node):
                         self.comm_state = COMM_IDLE
                         self.pending_outgoing_msg = None
                         self.get_logger().info(
-                            "BONUS: PARKED ACK — will send again in 4 s "
+                            f"BONUS: PARKED ACK — will send again in "
+                            f"{PARKED_INTERVAL_SEC:.0f} s "
                             "until server OK (INVALID keeps going)")
                     elif self.fsm_state == FSM_SEND_PACKET:
                         self._note_leg_complete(
@@ -1037,7 +1082,7 @@ class QRDetector(Node):
                             f"SAFE ZONE MISSION SUCCESS\n"
                             f"ACK Received - Publishing /resume_line_following\n"
                             f"Timestamp: {self._get_timestamp_str()}\n"
-                            f"Legs: {self.mission_leg_count}/6\n"
+                            f"Legs: {self.mission_leg_count}/{TOTAL_MISSION_LEGS}\n"
                             f"--------------------------------\n"
                         )
                         if not self.bonus_active:
@@ -1327,4 +1372,3 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
-
