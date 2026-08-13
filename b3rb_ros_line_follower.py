@@ -24,6 +24,7 @@ class MissionState:
     WAITING_FOR_SERVER_ACK = "WAITING_FOR_SERVER_ACK"
     NAVIGATING_TO_NEXT_TARGET = "NAVIGATING_TO_NEXT_TARGET"
     MISSION_COMPLETE = "MISSION_COMPLETE"
+    BONUS_PARKING = "BONUS_PARKING"
 
 
 # This is a controller sub-mode, not a mission-FSM state. Keeping it separate
@@ -75,6 +76,29 @@ class LineFollower(Node):
         self.declare_parameter('obstacle_speed', 0.37)
         self.declare_parameter('turn_edge_margin_px', 35.0)
         self.declare_parameter('junction_width_ratio', 1.8)
+
+        # Blind driving: BOTH lane edges lost. Instead of coasting on the old
+        # PID output, crawl and hold a fixed rotation matching the last sign
+        # board command until at least one edge is seen again.
+        self.declare_parameter('blind_drive_enable', True)
+        self.declare_parameter('no_vector_speed', 0.20)
+        self.declare_parameter('no_vector_turn_magnitude', 0.5)
+
+        # Odom yaw turn-lock for LEFT/RIGHT corners. Armed on the rising edge
+        # of the existing junction_wide signal, released only when the heading
+        # target is met AND the camera reports normal lane width again.
+        self.declare_parameter('turn_lock_enable', True)
+        self.declare_parameter('turn_angle_deg', 90.0)
+        self.declare_parameter('turn_yaw_gain', 1.2)
+        self.declare_parameter('turn_yaw_blend', 0.25)
+        self.declare_parameter('turn_yaw_exit_deg', 6.0)
+        self.declare_parameter('turn_yaw_sign_flip', False)
+        self.declare_parameter('turn_lock_max_time', 6.0)
+
+        # Dynamic top speed. The ceiling only rises after a streak of calm
+        # frames and collapses back to speed_straight the moment it ends.
+        self.declare_parameter('speed_max', 0.95)
+        self.declare_parameter('speed_max_ramp_frames', 10)
 
         # Straight-intersection state machine
         self.declare_parameter('intersect_entry_width_ratio', 1.6)
@@ -197,8 +221,25 @@ class LineFollower(Node):
         self.declare_parameter('wall_confirm_frames', 2)
         self.declare_parameter('parking_timeout_s', 15.0)
 
+        # After QR (patient AND hospital):
+        #  0–3.0 m  : keep driving, never stop
+        #  3.0–4.5 m: if LiDAR wall confirmed → stop
+        #  4.5 m    : hard stop (no wall needed)
+        self.declare_parameter('patient_zone_distance', 4.5)
+        self.declare_parameter('hospital_zone_distance', 4.5)
+        self.declare_parameter('qr_gone_drive_distance', 3.0)
+        self.declare_parameter('zone_wall_search_start', 3.0)
+        self.declare_parameter('zone_wall_max_lateral_m', 2.5)
+        self.declare_parameter('zone_wall_confirm_scans', 3)
+        self.declare_parameter('zone_use_hardcoded_distance', True)
+
         # Mission synchronization
         self.declare_parameter('target_type_wait_timeout', 0.5)
+        self.declare_parameter('bonus_approach_distance', 2.5)
+        self.declare_parameter('bonus_reverse_distance', 0.45)
+        self.declare_parameter('bonus_approach_speed', 0.28)
+        self.declare_parameter('bonus_reverse_speed', 0.16)
+        self.declare_parameter('bonus_wall_stop_dist', 0.80)
 
         self._reload_params()
         if not hasattr(self, 'turn_search_increase_frac'):
@@ -368,6 +409,39 @@ class LineFollower(Node):
         self._odom_linear_x = None
         self._odom_angular_z = None
         self._odom_time = None
+        self.current_yaw = None
+        self._odom_pose_xy = None
+        self._odom_pose_dist = 0.0
+        self._zone_dist_log_time = 0.0
+        self._zone_approach_start_time = None
+        self._zone_approach_driven = 0.0
+        self._zone_distance_phase = "IDLE"
+        self._zone_wall_streak = 0
+        self._zone_wall_scan_seq = -1
+        self._zone_wall_side = None
+        self._qr_not_visible = False
+        self._qr_not_visible_time = None
+        self._qr_gone_start_dist = None
+        self._qr_gone_extra = 0.0
+
+        # Bonus two-lane reverse+straight park
+        self._bp_mode = "BP_OFF"
+        self._bp_rev_t0 = None
+        self._bp_rev_signed0 = None
+        self._signed_dist = 0.0
+        self._bonus_log_t = 0.0
+
+        # Blind driving / odom turn-lock / speed ceiling runtime
+        self._blind_driving = False
+        self._blind_turn = 0.0
+        self._turn_lock_active = False
+        self._turn_lock_entry_yaw = 0.0
+        self._turn_lock_target_yaw = 0.0
+        self._turn_lock_start_time = None
+        self._junction_wide = False
+        self._prev_junction_wide = False
+        self._speed_ceiling = self.speed_straight
+        self._speed_calm_frames = 0
 
         # LiDAR debug data
         self._orient_map_log_time = 0.0
@@ -417,6 +491,11 @@ class LineFollower(Node):
             String, '/mission/available', self.mission_available_callback, 10)
         self.create_subscription(
             Odometry, '/odom', self.odom_callback, QOS_PROFILE_DEFAULT)
+        self.create_subscription(
+            Bool, '/qr_not_visible', self.qr_not_visible_callback,
+            QOS_PROFILE_DEFAULT)
+        self.create_subscription(
+            String, '/bonus', self.bonus_callback, QOS_PROFILE_DEFAULT)
 
         self.pub_joy = self.create_publisher(
             Joy, '/cerebri/in/joy', QOS_PROFILE_DEFAULT)
@@ -430,9 +509,9 @@ class LineFollower(Node):
             "Lane-following controller loaded.\n"
             f"Mission FSM initial state: {self.mission_state}\n"
             f"STRAIGHT green-board topic: {self.green_board_topic}\n"
-            "LEFT/RIGHT: if inner vector missing, increase that "
-            "turn by a percentage; if visible, follow at a standoff.")
-
+            "LEFT/RIGHT: odom turn-lock + SEARCH/FOLLOW.\n"
+            "After QR: 0-3.0 m no stop, 3.0-4.5 m wall stop, 4.5 m hard stop.\n"
+            "Bonus: /bonus → 2-lane reverse+straight park.")
     def _transition_mission_state(self, new_state, reason=""):
         old = self.mission_state
         if old == new_state:
@@ -477,6 +556,16 @@ class LineFollower(Node):
         self._last_travel_at_check = None
         self._travel_dist = 0.0
         self._last_travel_time = None
+        self._odom_pose_xy = None
+        self._odom_pose_dist = 0.0
+        self._zone_dist_log_time = 0.0
+        self._zone_approach_start_time = None
+        self._zone_approach_driven = 0.0
+        self._zone_distance_phase = "IDLE"
+        self._zone_wall_streak = 0
+        self._zone_wall_scan_seq = -1
+        self._zone_wall_side = None
+        self._qr_gone_start_dist = None
         self._zone_valid_distances = []
         self._zone_sector_data = []
 
@@ -506,6 +595,30 @@ class LineFollower(Node):
         self.obstacle_speed = g('obstacle_speed')
         self.turn_edge_margin_px = g('turn_edge_margin_px')
         self.junction_width_ratio = g('junction_width_ratio')
+
+        self.blind_drive_enable = bool(g('blind_drive_enable'))
+        self.no_vector_speed = max(
+            SPEED_MIN, min(SPEED_MAX, float(g('no_vector_speed'))))
+        self.no_vector_turn_magnitude = max(
+            0.0, min(TURN_MAX, float(g('no_vector_turn_magnitude'))))
+
+        self.turn_lock_enable = bool(g('turn_lock_enable'))
+        self.turn_angle_deg = max(
+            5.0, min(180.0, float(g('turn_angle_deg'))))
+        self.turn_yaw_gain = max(0.0, float(g('turn_yaw_gain')))
+        self.turn_yaw_blend = max(
+            0.0, min(1.0, float(g('turn_yaw_blend'))))
+        self.turn_yaw_exit_deg = max(
+            1.0, float(g('turn_yaw_exit_deg')))
+        self.turn_yaw_sign_flip = bool(g('turn_yaw_sign_flip'))
+        self.turn_lock_max_time = max(
+            0.5, float(g('turn_lock_max_time')))
+
+        self.speed_max = max(
+            self.speed_straight,
+            min(SPEED_MAX, float(g('speed_max'))))
+        self.speed_max_ramp_frames = max(
+            1, int(g('speed_max_ramp_frames')))
 
         self.intersect_entry_width_ratio = g('intersect_entry_width_ratio')
         self.intersect_exit_width_ratio = g('intersect_exit_width_ratio')
@@ -551,6 +664,66 @@ class LineFollower(Node):
         self.hospital_parking_forward_distance = max(
             self.parking_forward_distance,
             float(g('hospital_parking_forward_distance')))
+        try:
+            self.patient_zone_distance = max(
+                0.1, float(g('patient_zone_distance')))
+        except Exception:
+            self.patient_zone_distance = 4.5
+        try:
+            self.hospital_zone_distance = max(
+                0.1, float(g('hospital_zone_distance')))
+        except Exception:
+            self.hospital_zone_distance = 4.5
+        try:
+            self.zone_wall_search_start = max(
+                0.0, float(g('zone_wall_search_start')))
+        except Exception:
+            self.zone_wall_search_start = 3.0
+        try:
+            self.zone_wall_max_lateral_m = max(
+                0.4, float(g('zone_wall_max_lateral_m')))
+        except Exception:
+            self.zone_wall_max_lateral_m = 2.5
+        try:
+            self.zone_wall_confirm_scans = max(
+                1, int(g('zone_wall_confirm_scans')))
+        except Exception:
+            self.zone_wall_confirm_scans = 3
+        try:
+            self.qr_gone_drive_distance = max(
+                0.0, float(g('qr_gone_drive_distance')))
+        except Exception:
+            self.qr_gone_drive_distance = 3.0
+        try:
+            self.zone_use_hardcoded_distance = bool(
+                g('zone_use_hardcoded_distance'))
+        except Exception:
+            self.zone_use_hardcoded_distance = True
+        try:
+            self.bonus_approach_distance = max(
+                0.3, float(g('bonus_approach_distance')))
+        except Exception:
+            self.bonus_approach_distance = 2.5
+        try:
+            self.bonus_reverse_distance = max(
+                0.05, float(g('bonus_reverse_distance')))
+        except Exception:
+            self.bonus_reverse_distance = 0.45
+        try:
+            self.bonus_approach_speed = max(
+                SPEED_MIN, min(SPEED_MAX, float(g('bonus_approach_speed'))))
+        except Exception:
+            self.bonus_approach_speed = 0.28
+        try:
+            self.bonus_reverse_speed = max(
+                0.05, min(SPEED_MAX, float(g('bonus_reverse_speed'))))
+        except Exception:
+            self.bonus_reverse_speed = 0.16
+        try:
+            self.bonus_wall_stop_dist = max(
+                0.20, float(g('bonus_wall_stop_dist')))
+        except Exception:
+            self.bonus_wall_stop_dist = 0.80
         self.hospital_parking_require_wall = bool(
             g('hospital_parking_require_wall'))
         self.wall_min_range_m = g('wall_min_range_m')
@@ -686,7 +859,6 @@ class LineFollower(Node):
             self.get_logger().info(
                 f"Green-board subscription moved to "
                 f"{self.green_board_topic}")
-
     # ------------------------------------------------------------------
     # Green-board direction input (String: LEFT/CENTER/RIGHT/LOST)
     # ------------------------------------------------------------------
@@ -813,6 +985,7 @@ class LineFollower(Node):
             MissionState.PARKED_IN_SAFE_ZONE,
             MissionState.WAITING_FOR_SERVER_ACK,
             MissionState.MISSION_COMPLETE,
+            MissionState.BONUS_PARKING,
         )
 
     def _clear_pending_assembly(self):
@@ -846,9 +1019,28 @@ class LineFollower(Node):
             f"QR          : {qr}")
         self._clear_pending_assembly()
         self._reset_zone_detection()
+        self._zone_distance_phase = "APPROACH"
+        self._zone_approach_start_time = time.time()
+        self._last_travel_time = time.time()
+        target_run = self._active_zone_approach_distance()
+        zone_kind = (
+            "hospital" if self._is_hospital_parking() else "patient")
         self._transition_mission_state(
             MissionState.WAITING_FOR_SAFE_ZONE,
             f"/target_qr received: {qr} (target type: {ttype})")
+        banner = (
+            "========================================\n"
+            "QR DETECTED — distance counter START\n"
+            f"Target type : {ttype}\n"
+            f"QR          : {qr}\n"
+            f"Hard stop   : {target_run:.2f} m ({zone_kind})\n"
+            f"Wall window : {getattr(self, 'zone_wall_search_start', 3.0):.2f}"
+            f"–{target_run:.2f} m (wall → stop, else 4.5 m)\n"
+            "No stop before 3.0 m\n"
+            "Travelled   : 0.00 m\n"
+            "========================================")
+        self.get_logger().info(banner)
+        print(banner, flush=True)
         self.get_logger().info("Mission activated.")
 
     def _complete_active_mission(self, reason=""):
@@ -862,6 +1054,9 @@ class LineFollower(Node):
         self.active_target_qr = ""
         self.target_qr_string = ""
         self._last_mission_key = None
+        self._qr_not_visible = False
+        self._qr_not_visible_time = None
+        self._qr_gone_start_dist = None
         self._reset_zone_detection()
 
     def _promote_pending_next(self):
@@ -889,7 +1084,8 @@ class LineFollower(Node):
     def _process_resume(self, received):
         if self.mission_state not in (
                 MissionState.PARKED_IN_SAFE_ZONE,
-                MissionState.WAITING_FOR_SERVER_ACK):
+                MissionState.WAITING_FOR_SERVER_ACK,
+                MissionState.BONUS_PARKING):
             self.get_logger().info(
                 f"{received} ignored in state {self.mission_state}")
             return
@@ -908,7 +1104,6 @@ class LineFollower(Node):
             MissionState.NAVIGATING_TO_NEXT_TARGET,
             "Server ACK / RESUME received")
         self._wait_log_time = 0.0
-
     def mission_callback(self, msg):
         mission = msg.data
         if not mission or not mission.strip() or mission.strip() == "NONE":
@@ -1325,7 +1520,6 @@ class LineFollower(Node):
             self.avoidance_direction = "NONE"
             self._green_avoid_target_direction = "LOST"
         self._green_obstacle_clear_since = None
-
     def _compute_straight_green_control(self, now, base_turn, base_speed):
         """Combine board target, obstacle commitment/recovery and lane safety."""
         direction, weight = self._effective_green_direction(now)
@@ -1541,7 +1735,6 @@ class LineFollower(Node):
             f"Speed       : {speed:.2f}\n"
             f"Lane safe   : {'YES' if self._green_last_lane_safe else 'NO'}\n"
             f"State       : {self._green_guidance_mode}")
-
     # ==================================================================
     # LEFT / RIGHT intersection turn
     # Same pattern as STRAIGHT: STOP → DECIDE committed side → GO.
@@ -2100,7 +2293,6 @@ class LineFollower(Node):
             f"Steering    : {steering:+.3f}\n"
             f"Speed       : {speed:.2f}\n"
             f"Reason      : {self._turn_last_reason}")
-
     # Intersection helpers
     def _reset_intersection_state(self):
         self._in_intersection = False
@@ -2108,6 +2300,13 @@ class LineFollower(Node):
         self._intersection_heading = 0.0
         self._intersection_cte = 0.0
         self._intersection_stable_count = 0
+        if hasattr(self, '_turn_lock_active'):
+            # A stale lock from a previous corner must never survive a
+            # mission change.
+            self._turn_lock_active = False
+            self._turn_lock_start_time = None
+            self._prev_junction_wide = False
+            self._junction_wide = False
         if hasattr(self, '_green_guidance_mode'):
             self._reset_straight_green_guidance()
 
@@ -2129,6 +2328,10 @@ class LineFollower(Node):
     def _lane_heading(vec_left, vec_right):
         return 0.5 * (LineFollower._vector_heading(vec_left) +
                       LineFollower._vector_heading(vec_right))
+
+    @staticmethod
+    def _wrap_angle(a):
+        return math.atan2(math.sin(a), math.cos(a))
 
     @staticmethod
     def _clamp_heading(h, max_deg=45.0):
@@ -2186,6 +2389,10 @@ class LineFollower(Node):
         if img_center <= 0:
             return
         count = message.vector_count
+        if count >= 1:
+            # Any visible edge ends blind driving; the untouched one/two
+            # vector centring code below takes over again by itself.
+            self._blind_driving = False
         mission_straight = (self.current_mission == "STRAIGHT")
         if not mission_straight and self._in_intersection:
             self._reset_intersection_state()
@@ -2407,6 +2614,30 @@ class LineFollower(Node):
                 self.learned_lane_width > 0.0 and
                 lane_width > self.learned_lane_width *
                 self.junction_width_ratio)
+            self._junction_wide = junction_wide
+            if (self.turn_lock_enable and junction_wide and
+                    not self._prev_junction_wide and
+                    not self._turn_lock_active and
+                    self.current_yaw is not None and
+                    self.current_mission in ("LEFT", "RIGHT")):
+                # Rising edge of the corner: snapshot the heading goal.
+                # yaw_sign encodes "odom yaw grows when steering LEFT"
+                # (REP-103). Flip the parameter if the sim reports the
+                # opposite; entry target and steering command flip together.
+                yaw_sign = -1.0 if self.turn_yaw_sign_flip else 1.0
+                sign = (
+                    yaw_sign if self.current_mission == "LEFT" else -yaw_sign)
+                self._turn_lock_active = True
+                self._turn_lock_start_time = now
+                self._turn_lock_entry_yaw = self.current_yaw
+                self._turn_lock_target_yaw = self._wrap_angle(
+                    self.current_yaw +
+                    sign * math.radians(self.turn_angle_deg))
+                self.get_logger().info(
+                    f"*** TURN LOCK armed ({self.current_mission}) "
+                    f"yaw={math.degrees(self.current_yaw):+.0f} -> "
+                    f"{math.degrees(self._turn_lock_target_yaw):+.0f}")
+            self._prev_junction_wide = junction_wide
             lane_center = 0.5 * (left_x + right_x)
             if (not self._turn_completed and
                     self.current_mission in ("LEFT", "RIGHT")):
@@ -2548,6 +2779,16 @@ class LineFollower(Node):
             if self._update_left_right_turn(
                     now, img_center, 0):
                 return
+            if self.blind_drive_enable:
+                # Both edges lost: crawl and hold the rotation implied by the
+                # last sign board command instead of coasting on stale PID.
+                self._blind_driving = True
+                sign = (
+                    -1.0 if self.current_mission == "LEFT"
+                    else 1.0 if self.current_mission == "RIGHT" else 0.0)
+                self._blind_turn = max(
+                    TURN_MIN, min(
+                        TURN_MAX, sign * self.no_vector_turn_magnitude))
             self.vectors_available = False
             return
 
@@ -2567,6 +2808,33 @@ class LineFollower(Node):
                 self.target_turn = max(
                     TURN_MIN, min(TURN_MAX, self.target_turn + ff))
             self._one_vec_ff_heading = None
+        if self._turn_lock_active:
+            if (self.current_yaw is None or
+                    self.current_mission not in ("LEFT", "RIGHT") or
+                    (self._turn_lock_start_time is not None and
+                     now - self._turn_lock_start_time >
+                     self.turn_lock_max_time)):
+                self._turn_lock_active = False
+            else:
+                yaw_err = self._wrap_angle(
+                    self._turn_lock_target_yaw - self.current_yaw)
+                yaw_sign = -1.0 if self.turn_yaw_sign_flip else 1.0
+                # Internal convention: negative turn = LEFT, positive = RIGHT.
+                yaw_turn = max(
+                    TURN_MIN, min(
+                        TURN_MAX,
+                        -self.turn_yaw_gain * yaw_sign * yaw_err))
+                blend = self.turn_yaw_blend
+                self.target_turn = max(
+                    TURN_MIN, min(
+                        TURN_MAX,
+                        (1.0 - blend) * yaw_turn +
+                        blend * self.target_turn))
+                # Released only when heading AND camera lane width agree.
+                if (abs(yaw_err) < math.radians(self.turn_yaw_exit_deg) and
+                        not self._junction_wide):
+                    self._turn_lock_active = False
+                    self.get_logger().info("*** TURN LOCK released")
         self.target_speed = self._compute_speed(
             self.target_turn,
             tail_curvature if 'tail_curvature' in locals() else 0.0)
@@ -2610,6 +2878,22 @@ class LineFollower(Node):
         speed -= (
             curve_severity *
             (self.speed_straight - self.speed_sharp) * 0.6)
+        # Dynamic ceiling: only a streak of calm frames may raise the top
+        # speed; any turn, curvature or active turn-lock collapses it.
+        calm = (
+            abs(turn) < 0.12 and curve_severity < 0.15 and
+            not self._turn_lock_active and not self._blind_driving)
+        if calm:
+            self._speed_calm_frames += 1
+        else:
+            self._speed_calm_frames = 0
+            self._speed_ceiling = self.speed_straight
+        if self._speed_calm_frames >= self.speed_max_ramp_frames:
+            self._speed_ceiling = min(
+                self.speed_max, self._speed_ceiling + 0.02)
+        speed = min(speed, max(self.speed_straight, self._speed_ceiling))
+        if calm and self._speed_ceiling > self.speed_straight:
+            speed = self._speed_ceiling
         return max(self.speed_sharp * 0.5, speed)
 
     # LiDAR callback
@@ -2687,7 +2971,183 @@ class LineFollower(Node):
         self._update_wall_geometry(
             ranges, n, msg.angle_min, msg.angle_increment,
             getattr(msg, 'range_max', float('inf')))
+    # ------------------------------------------------------------------
+    # Hard-coded patient / hospital run-in after QR
+    # ------------------------------------------------------------------
+    def _active_zone_approach_distance(self):
+        if self._is_hospital_parking():
+            return getattr(self, 'hospital_zone_distance', 4.5)
+        return getattr(self, 'patient_zone_distance', 4.5)
 
+    def _after_qr_elapsed(self, now=None):
+        if now is None:
+            now = time.time()
+        t0 = getattr(self, '_zone_approach_start_time', None)
+        if t0 is None:
+            return 0.0
+        return max(0.0, now - t0)
+
+    def _after_qr_driven(self):
+        """Best available meters since QR: odom pose path, else speed integral."""
+        integ = float(getattr(self, '_travel_dist', 0.0))
+        pose = float(getattr(self, '_odom_pose_dist', 0.0))
+        odom_fresh = (
+            self._odom_time is not None and
+            time.time() - self._odom_time < 0.40)
+        if odom_fresh and pose >= 0.10:
+            return pose, integ, pose, "odom_pose"
+        src = "odom.twist" if odom_fresh else "cmd_vel"
+        return integ, integ, pose, src
+
+    def _approach_wall_seen(self):
+        """True when LiDAR shows a nearby side wall or a front bay cluster."""
+        max_lat = float(getattr(self, 'zone_wall_max_lateral_m', 2.5))
+        need_beams = max(3, int(getattr(self, 'wall_min_beams', 4)))
+        geom = getattr(self, '_wall_geom', {}) or {}
+        side = self._select_wall_side()
+        order = []
+        if side:
+            order.append(side)
+        for s in ("LEFT", "RIGHT"):
+            if s not in order:
+                order.append(s)
+        for s in order:
+            g = geom.get(s)
+            if g is None:
+                continue
+            lat = abs(float(g.get("lateral_m", 99.0)))
+            beams = int(g.get("beams", 0))
+            length = float(g.get("len_m", 0.0))
+            if beams >= need_beams and lat <= max_lat and length >= 0.30:
+                return True, s, g
+        # Existing close-beam FOV = front / bay wall
+        if (self._zone_close_count >=
+                int(self.zone_close_beam_threshold)):
+            return True, "FRONT", None
+        return False, None, None
+
+    def _finish_hardcoded_zone_stop(self, now, driven, target, reason):
+        """Park immediately at the current pose. No extra 1.5/1.7 m creep."""
+        if getattr(self, '_safe_zone_published', False):
+            return
+        pose = float(getattr(self, '_odom_pose_dist', 0.0))
+        self._zone_approach_driven = driven
+        self._park_start_dist = driven
+        self._zone_distance_phase = "IDLE"
+        msg = (
+            f"*** ZONE STOP  reason={reason}  "
+            f"driven={driven:.2f}/{target:.2f} m  "
+            f"odom_pose={pose:.2f} m  "
+            f"wall={getattr(self, '_zone_wall_side', None)}  "
+            f"streak={getattr(self, '_zone_wall_streak', 0)}  "
+            f"t={self._after_qr_elapsed(now):.1f}s  "
+            f"type={self.active_target_type}")
+        self.get_logger().info(msg)
+        print(msg, flush=True)
+        self._parking_completion_reason = (
+            f"{reason} at {driven:.2f}/{target:.2f} m "
+            f"(no extra park creep)")
+        self.publish_drive_cmd(0.0, 0.0)
+        self._on_parking_complete()
+
+    def _log_after_qr_distance(self, now, force=False):
+        """Print travelled distance + wall status after QR."""
+        phase = getattr(self, '_zone_distance_phase', "IDLE")
+        if phase == "IDLE" and not force:
+            return
+        last = getattr(self, '_zone_dist_log_time', 0.0)
+        if (not force) and (now - last < 0.5):
+            return
+        self._zone_dist_log_time = now
+        target = self._active_zone_approach_distance()
+        win0 = float(getattr(self, 'zone_wall_search_start', 3.0))
+        driven, integ, pose, src = self._after_qr_driven()
+        remain = max(0.0, target - driven)
+        wall, wside, g = self._approach_wall_seen()
+        lat = (
+            f"{abs(g['lateral_m']):.2f}m" if g is not None else "n/a")
+        need = int(getattr(self, 'zone_wall_confirm_scans', 3))
+        in_win = win0 <= driven < target
+        line = (
+            f"[AfterQR DIST] phase=APPROACH  "
+            f"travelled={driven:.2f}/{target:.2f} m  "
+            f"remain={remain:.2f} m  "
+            f"integ={integ:.2f} pose={pose:.2f} ({src})  "
+            f"window={'YES' if in_win else 'NO'}({win0:.1f}-{target:.1f})  "
+            f"wall={'YES' if wall else 'NO'} side={wside} lat={lat}  "
+            f"streak={getattr(self, '_zone_wall_streak', 0)}/{need}  "
+            f"qr_gone={'YES' if getattr(self, '_qr_not_visible', False) else 'NO'}  "
+            f"after_gone={getattr(self, '_qr_gone_extra', 0.0):.2f}/"
+            f"{getattr(self, 'qr_gone_drive_distance', 3.0):.2f} m  "
+            f"close={self._zone_close_count}/"
+            f"{self.zone_close_beam_threshold}  "
+            f"v={self._forward_speed_estimate():.2f} m/s  "
+            f"t={self._after_qr_elapsed(now):.1f}s  "
+            f"type={self.active_target_type}  "
+            f"qr={self.active_target_qr}")
+        self.get_logger().info(line)
+        print(line, flush=True)
+
+    def _arm_qr_gone_drive(self, driven):
+        """Latch odom at the instant the matched QR leaves the camera."""
+        if getattr(self, '_qr_gone_start_dist', None) is not None:
+            return
+        extra = float(getattr(self, 'qr_gone_drive_distance', 3.0))
+        self._qr_gone_start_dist = float(driven)
+        stop_at = float(driven) + extra
+        msg = (
+            f"*** QR not visible — drive {extra:.2f} m more then STOP  "
+            f"(now={driven:.2f} m, stop_at={stop_at:.2f} m)")
+        self.get_logger().info(msg)
+        print(msg, flush=True)
+
+    def _run_hardcoded_zone_approach(self, now):
+        """After QR: no stop before 3 m.
+
+        3.0–4.5 m : stop only if a LiDAR wall is confirmed.
+        4.5 m     : hard stop even with no wall.
+        """
+        self._update_travel_distance(now)
+        hard_stop = float(self._active_zone_approach_distance())
+        win0 = float(getattr(self, 'zone_wall_search_start', 3.0))
+        need = int(getattr(self, 'zone_wall_confirm_scans', 3))
+        driven, _integ, _pose, _src = self._after_qr_driven()
+
+        wall, wside, _g = self._approach_wall_seen()
+        scan = int(getattr(self, '_scan_seq', 0))
+        in_win = win0 <= driven < hard_stop
+        if scan != getattr(self, '_zone_wall_scan_seq', -1):
+            self._zone_wall_scan_seq = scan
+            if in_win and wall:
+                self._zone_wall_streak = (
+                    getattr(self, '_zone_wall_streak', 0) + 1)
+                self._zone_wall_side = wside
+            else:
+                self._zone_wall_streak = 0
+                if driven < win0:
+                    self._zone_wall_side = None
+
+        wall_ok = (
+            in_win and
+            getattr(self, '_zone_wall_streak', 0) >= need)
+        wall_name = wside or getattr(self, '_zone_wall_side', None)
+        self._log_after_qr_distance(now)
+
+        # Never stop before 3.0 m.
+        if driven < win0:
+            return
+
+        # 3.0–4.5 m: wall → stop.
+        if wall_ok:
+            self._finish_hardcoded_zone_stop(
+                now, driven, hard_stop,
+                f"wall_3_to_4.5 ({wall_name})")
+            return
+
+        # 4.5 m: always stop.
+        if driven >= hard_stop:
+            self._finish_hardcoded_zone_stop(
+                now, driven, hard_stop, "hard_stop_4.5m")
     # Main control loop
     def control_loop(self):
         now = time.time()
@@ -2727,18 +3187,32 @@ class LineFollower(Node):
             self._reset_turn_state()
             self.publish_drive_cmd(0.0, 0.0)
             return
+        if (self.mission_state == MissionState.BONUS_PARKING and
+                getattr(self, '_bp_mode', "BP_OFF") == "BP_DONE"):
+            self.publish_drive_cmd(0.0, 0.0)
+            return
 
         if self.mission_state == MissionState.ENTERING_SAFE_ZONE:
             # Parking remains entirely on the original controller path.
             self._reset_straight_green_guidance()
             self._reset_turn_state()
             self._update_travel_distance(now)
+            self._log_after_qr_distance(now)
             self._run_parking_check(now)
             if self.mission_state == MissionState.PARKED_IN_SAFE_ZONE:
                 return
 
         if self.mission_state == MissionState.WAITING_FOR_SAFE_ZONE:
-            self._run_safe_zone_detector(now)
+            if (getattr(self, '_qr_not_visible', False) or
+                    getattr(self, 'zone_use_hardcoded_distance', True)):
+                self._run_hardcoded_zone_approach(now)
+                if self.mission_state == MissionState.PARKED_IN_SAFE_ZONE:
+                    self.publish_drive_cmd(0.0, 0.0)
+                    return
+            else:
+                self._update_travel_distance(now)
+                self._log_after_qr_distance(now)
+                self._run_safe_zone_detector(now)
 
         if self._in_intersection:
             if (self.last_vector_time is not None and
@@ -2823,6 +3297,13 @@ class LineFollower(Node):
         elif self._in_intersection:
             want_turn = self.target_turn
             want_speed = self.target_speed
+        elif self._blind_driving:
+            # Both edges lost: crawl on the sign-board rotation until the
+            # camera sees a lane edge again.
+            want_turn = self._blind_turn
+            want_speed = self.no_vector_speed
+            self.integral = 0.0
+            self.prev_time = None
         elif self.vectors_available:
             want_turn = self.target_turn
             want_speed = self.target_speed
@@ -2842,6 +3323,13 @@ class LineFollower(Node):
             self.integral = 0.0
             self.prev_time = None
 
+        if self.mission_state == MissionState.BONUS_PARKING:
+            self._update_travel_distance(now)
+            want_turn, want_speed = self._bonus_drive(now, want_turn, want_speed)
+            if getattr(self, '_bp_mode', "") == "BP_DONE":
+                self.publish_drive_cmd(0.0, 0.0)
+                return
+
         if self.mission_state == MissionState.WAITING_FOR_SAFE_ZONE:
             want_speed = min(want_speed, self.slow_approach_speed)
         elif self.mission_state == MissionState.ENTERING_SAFE_ZONE:
@@ -2849,19 +3337,30 @@ class LineFollower(Node):
             if not self.vectors_available and not self.obstacle_detected:
                 want_turn = self.last_good_turn
 
+        bonus_reverse = (
+            self.mission_state == MissionState.BONUS_PARKING and
+            getattr(self, '_bp_mode', '') == 'BP_REVERSE')
+
         steer_alpha = self.steer_alpha
         if abs(want_turn) > 0.35:
             steer_alpha = max(steer_alpha, 0.75)
         self.filtered_turn = (
             steer_alpha * want_turn +
             (1.0 - steer_alpha) * self.filtered_turn)
-        self.filtered_speed = (
-            self.speed_alpha * want_speed +
-            (1.0 - self.speed_alpha) * self.filtered_speed)
-        final_turn = max(TURN_MIN, min(TURN_MAX, self.filtered_turn))
-        final_speed = max(SPEED_MIN, min(SPEED_MAX, self.filtered_speed))
+        if bonus_reverse:
+            # Negative Joy speed = reverse. Do not clamp through SPEED_MIN=0.
+            self.filtered_speed = want_speed
+            final_turn = 0.0
+            final_speed = float(want_speed)
+            self.filtered_turn = 0.0
+        else:
+            self.filtered_speed = (
+                self.speed_alpha * want_speed +
+                (1.0 - self.speed_alpha) * self.filtered_speed)
+            final_turn = max(TURN_MIN, min(TURN_MAX, self.filtered_turn))
+            final_speed = max(SPEED_MIN, min(SPEED_MAX, self.filtered_speed))
 
-        if green_control_active:
+        if green_control_active and not bonus_reverse:
             # FINAL safety priority: apply after green, obstacle recovery and
             # command filtering so none of them can use filter inertia to touch
             # or cross a currently observed lane boundary.
@@ -2872,7 +3371,7 @@ class LineFollower(Node):
                 final_speed = 0.0
             self._log_straight_green_guidance(
                 now, final_turn, final_speed)
-        elif turn_control_active:
+        elif turn_control_active and not bonus_reverse:
             # Clamp only a REAL inner edge. Never stop to "decide".
             final_turn, lane_safe = self._enforce_turn_lane_safety(
                 final_turn, now)
@@ -2899,6 +3398,15 @@ class LineFollower(Node):
                 mode = (
                     'INT' if self._in_intersection else
                     ('OBS' if self.obstacle_detected else 'NORM'))
+            yaw_txt = (
+                "NA" if self.current_yaw is None
+                else f"{math.degrees(self.current_yaw):+.0f}")
+            yaw_tgt_txt = (
+                f"{math.degrees(self._turn_lock_target_yaw):+.0f}"
+                if self._turn_lock_active else "NA")
+            driven, _i, _p, _s = (0.0, 0.0, 0.0, "")
+            if self.mission_state == MissionState.WAITING_FOR_SAFE_ZONE:
+                driven, _i, _p, _s = self._after_qr_driven()
             self.get_logger().info(
                 f"vec={'Y' if self.vectors_available else 'N'} "
                 f"side={self.last_single_side} "
@@ -2911,9 +3419,12 @@ class LineFollower(Node):
                 f"{self.nearest_dist:.2f} "
                 f"turn_int={final_turn:+.3f} "
                 f"joy={self.steer_sign * final_turn:+.3f} "
-                f"spd={final_speed:.2f}")
-
-    # Safe-zone detector
+                f"spd={final_speed:.2f} "
+                f"blind={'Y' if self._blind_driving else 'N'} "
+                f"tlock={'Y' if self._turn_lock_active else 'N'} "
+                f"yaw={yaw_txt} yaw_tgt={yaw_tgt_txt} "
+                f"ceil={self._speed_ceiling:.2f} "
+                f"afterQR={driven:.2f}m")
     def _run_safe_zone_detector(self, now):
         if now - self._lidar_debug_time >= 0.5:
             self._lidar_debug_time = now
@@ -2966,12 +3477,24 @@ class LineFollower(Node):
         self._park_start_time = 0.0
         self._park_start_dist = 0.0
         self._last_travel_at_check = None
+        approach = getattr(self, '_zone_approach_driven', 0.0)
+        if approach <= 0.0:
+            approach = float(getattr(self, '_travel_dist', 0.0))
+            self._zone_approach_driven = approach
+        pose = float(getattr(self, '_odom_pose_dist', 0.0))
+        target = self._active_zone_approach_distance()
         self._travel_dist = 0.0
         self._last_travel_time = None
+        self._odom_pose_xy = None
+        self._odom_pose_dist = 0.0
+        self._zone_distance_phase = "PARK"
         self.get_logger().info(
             "========================================\n"
             "SAFE ZONE DETECTED\n"
             f"Target type   : {self.active_target_type}\n"
+            f"QR            : {self.active_target_qr}\n"
+            f"After-QR dist : {approach:.2f} / {target:.2f} m\n"
+            f"Odom pose     : {pose:.2f} m (approach path)\n"
             f"Close beams   : {self._zone_close_count} "
             f"(threshold {self.zone_close_beam_threshold})\n"
             f"Consecutive   : {self.zone_confirm_scans} scans\n"
@@ -2979,6 +3502,11 @@ class LineFollower(Node):
             f"Min distance  : {self._zone_min_dist:.2f}m\n"
             "Entering Safe Zone...\n"
             "========================================")
+        print(
+            f"[AfterQR DIST] ZONE REACHED  travelled={approach:.2f}/"
+            f"{target:.2f} m  odom_pose={pose:.2f} m  "
+            f"type={self.active_target_type}  qr={self.active_target_qr}",
+            flush=True)
         self._transition_mission_state(
             MissionState.ENTERING_SAFE_ZONE,
             f"Safe zone detected (close beams "
@@ -3143,6 +3671,61 @@ class LineFollower(Node):
         if g_left is not None:
             return "LEFT"
         return "RIGHT" if g_right is not None else None
+    def _bonus_drive(self, now, turn, speed):
+        """Two-lane straight approach, then a short reverse, then stop."""
+        approach_m = float(getattr(self, 'bonus_approach_distance', 2.5))
+        reverse_m = float(getattr(self, 'bonus_reverse_distance', 0.45))
+        app_spd = float(getattr(self, 'bonus_approach_speed', 0.28))
+        rev_spd = float(getattr(self, 'bonus_reverse_speed', 0.16))
+        wall_d = float(getattr(self, 'bonus_wall_stop_dist', 0.80))
+
+        mode = getattr(self, '_bp_mode', "BP_OFF")
+        driven = float(getattr(self, '_travel_dist', 0.0))
+        signed = float(getattr(self, '_signed_dist', 0.0))
+        wall_hit = (
+            self.nearest_dist < wall_d and
+            math.isfinite(self.nearest_dist))
+
+        if now - getattr(self, '_bonus_log_t', 0.0) >= 0.5:
+            self._bonus_log_t = now
+            self.get_logger().info(
+                f"[BONUS] mode={mode} driven={driven:.2f}/"
+                f"{approach_m:.2f} m  signed={signed:.2f} "
+                f"wall={self.nearest_dist:.2f} m  "
+                f"vec={'Y' if self.vectors_available else 'N'}")
+
+        if mode == "BP_APPROACH":
+            yaw = turn if self.vectors_available else self.last_good_turn * 0.4
+            if wall_hit or driven >= approach_m:
+                self._bp_mode = "BP_REVERSE"
+                self._bp_rev_t0 = now
+                self._bp_rev_signed0 = signed
+                self.get_logger().info(
+                    f"*** BONUS  APPROACH done "
+                    f"(driven={driven:.2f} wall={self.nearest_dist:.2f}) "
+                    f"→ REVERSE {reverse_m:.2f} m")
+                return 0.0, 0.0
+            return yaw, min(app_spd, max(0.12, abs(speed) if speed else app_spd))
+
+        if mode == "BP_REVERSE":
+            t0 = self._bp_rev_t0 or now
+            s0 = self._bp_rev_signed0 if self._bp_rev_signed0 is not None else signed
+            back = s0 - signed
+            if back >= reverse_m or (now - t0) >= 3.5:
+                self._bp_mode = "BP_DONE"
+                self.publish_drive_cmd(0.0, 0.0)
+                if not self._safe_zone_published:
+                    self._safe_zone_published = True
+                    z = Bool()
+                    z.data = True
+                    self.pub_safe_zone.publish(z)
+                self.get_logger().info(
+                    f"*** BONUS PARKED  reverse={back:.2f} m  "
+                    "/safe_zone=True  (QR detector sends PARKED every 4 s)")
+                return 0.0, 0.0
+            return 0.0, -abs(rev_spd)
+
+        return 0.0, 0.0
 
     def _forward_speed_estimate(self):
         if (self._odom_linear_x is not None and
@@ -3150,6 +3733,13 @@ class LineFollower(Node):
                 time.time() - self._odom_time < 0.25):
             return max(0.0, self._odom_linear_x)
         return max(0.0, self._last_cmd_speed)
+
+    def _signed_speed_estimate(self):
+        if (self._odom_linear_x is not None and
+                self._odom_time is not None and
+                time.time() - self._odom_time < 0.25):
+            return float(self._odom_linear_x)
+        return float(self._last_cmd_speed)
 
     def _update_travel_distance(self, now):
         if self._last_travel_time is None:
@@ -3159,17 +3749,76 @@ class LineFollower(Node):
         self._last_travel_time = now
         if dt <= 0.0 or dt > 0.5:
             dt = 0.033
-        self._travel_dist += self._forward_speed_estimate() * dt
+        v = self._forward_speed_estimate()
+        signed = self._signed_speed_estimate()
+        self._travel_dist += max(0.0, v) * dt
+        self._signed_dist = float(getattr(self, '_signed_dist', 0.0)) + signed * dt
 
     def odom_callback(self, msg):
         try:
             self._odom_linear_x = float(msg.twist.twist.linear.x)
-            # Used only to measure obstacle-avoidance/recovery yaw. Parking
-            # distance still uses linear.x exactly as before.
+            # Used to measure obstacle-avoidance/recovery yaw and turn-lock.
             self._odom_angular_z = float(msg.twist.twist.angular.z)
+            # Absolute heading, used only by the LEFT/RIGHT turn-lock.
+            q = msg.pose.pose.orientation
+            siny = 2.0 * (q.w * q.z + q.x * q.y)
+            cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+            self.current_yaw = math.atan2(siny, cosy)
             self._odom_time = time.time()
+            px = float(msg.pose.pose.position.x)
+            py = float(msg.pose.pose.position.y)
+            last = getattr(self, '_odom_pose_xy', None)
+            if last is not None:
+                step = math.hypot(px - last[0], py - last[1])
+                if 0.0 < step < 2.0:
+                    self._odom_pose_dist = (
+                        getattr(self, '_odom_pose_dist', 0.0) + step)
+            self._odom_pose_xy = (px, py)
         except Exception:
             pass
+
+    def bonus_callback(self, msg):
+        data = (msg.data or "").strip().upper() if msg else ""
+        if data not in ("BONUS", "TRUE", "1", "START"):
+            return
+        if self.mission_state == MissionState.BONUS_PARKING:
+            self.get_logger().info("Duplicate /bonus ignored")
+            return
+        self._travel_dist = 0.0
+        self._signed_dist = 0.0
+        self._last_travel_time = time.time()
+        self._bp_mode = "BP_APPROACH"
+        self._bp_rev_t0 = None
+        self._bp_rev_signed0 = None
+        self._reset_straight_green_guidance()
+        self._reset_turn_state(clear_completed=True)
+        if hasattr(self, '_turn_lock_active'):
+            self._turn_lock_active = False
+        self._blind_driving = False
+        self._transition_mission_state(
+            MissionState.BONUS_PARKING,
+            "/bonus received — 2-lane reverse+straight park")
+        self.get_logger().info(
+            "*** BONUS PARK  APPROACH on two vectors, then REVERSE, then STOP")
+
+    def qr_not_visible_callback(self, msg):
+        """QR detector: verified matching QR left the camera (log only).
+
+        Zone stop is 3.0–4.5 m wall / 4.5 m hard — no extra 3 m run.
+        """
+        gone = bool(msg.data) if msg is not None else False
+        if gone:
+            if not getattr(self, '_qr_not_visible', False):
+                self.get_logger().info(
+                    "*** /qr_not_visible TRUE — matching QR left camera "
+                    "(zone still 3.0–4.5 / 4.5 m, no extra run)")
+            self._qr_not_visible = True
+            self._qr_not_visible_time = time.time()
+        else:
+            self._qr_not_visible = False
+            self._qr_not_visible_time = None
+            self._qr_gone_start_dist = None
+            self._qr_gone_extra = 0.0
 
     def _is_hospital_parking(self):
         target_type = str(self.active_target_type or "").upper()
@@ -3224,9 +3873,8 @@ class LineFollower(Node):
         wall_ok = (not wall_required) or self._hospital_wall_confirmed
         driven = self._travel_dist - self._park_start_dist
 
-        # Normal hospital completion cannot happen early: BOTH 1.7 m (default)
-        # and a confirmed mission-side wall are required. Patient behavior
-        # remains the original distance-only rule.
+        # Hardcoded 3.0–4.5 zone already parked via _finish_hardcoded_zone_stop.
+        # This path is only the legacy ENTERING_SAFE_ZONE creep.
         if driven >= target_distance and wall_ok:
             self._parking_completion_reason = (
                 f"distance {driven:.2f}/{target_distance:.2f} m; "
@@ -3292,14 +3940,30 @@ class LineFollower(Node):
         completion_reason = (
             self._parking_completion_reason or
             "parking distance covered")
-        self.get_logger().info(
+        park_d = max(0.0, self._travel_dist - self._park_start_dist)
+        approach = getattr(self, '_zone_approach_driven', 0.0)
+        if approach <= 0.0:
+            approach = float(getattr(self, '_odom_pose_dist', 0.0)
+                             or getattr(self, '_travel_dist', 0.0))
+        total = approach + park_d
+        self._zone_distance_phase = "IDLE"
+        done = (
             "========================================\n"
             "SAFE ZONE FULLY ENTERED\n"
             f"Parking result: {completion_reason}\n"
+            f"After-QR stop     : {approach:.2f} m\n"
+            f"Extra park creep  : {park_d:.2f} m\n"
+            f"Total after QR    : {total:.2f} m\n"
             "Stopping buggy...\n"
             "Publishing /safe_zone\n"
             "Waiting for QR Detector...\n"
             "========================================")
+        self.get_logger().info(done)
+        print(
+            f"[AfterQR DIST] PARKED  approach={approach:.2f} m  "
+            f"park={park_d:.2f} m  total={total:.2f} m  "
+            f"type={self.active_target_type}  qr={self.active_target_qr}",
+            flush=True)
         self._transition_mission_state(
             MissionState.PARKED_IN_SAFE_ZONE,
             f"{completion_reason} — /safe_zone published")
